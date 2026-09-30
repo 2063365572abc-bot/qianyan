@@ -1,0 +1,16 @@
+/devpost/learner-profile.md
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+node_modules/
+dist/
+*.tsbuildinfo
+playwright-report/
+test-results/
+.local/
+*.log
+/devpost/archive/

@@ -1,0 +1,66 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qianyan
+          POSTGRES_DB: qianyan_test
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qianyan -d qianyan_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://qianyan:ci-only-password@127.0.0.1:5432/qianyan_test
+      APP_PUBLIC_URL: http://testserver
+      SESSION_SECRET: ci-session-secret-never-use-in-production
+      NEBIUS_API_KEY: ""
+      WECOM_APP_SECRET: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - run: uv sync --frozen
+        working-directory: backend
+      - run: uv run python -m app.migrate
+        working-directory: backend
+      - run: uv run pytest
+        working-directory: backend
+      - run: uv run python ../scripts/preflight.py --env ../.env.example
+        working-directory: backend
+        # The deliberately incomplete example must fail deployment validation.
+        id: reject_example
+        continue-on-error: true
+      - run: test '${{ steps.reject_example.outcome }}' = failure
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

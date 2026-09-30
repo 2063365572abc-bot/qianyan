@@ -1,0 +1,20 @@
+# Local-only override. The production file never publishes PostgreSQL or API ports.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+  api:
+    environment:
+      APP_ENV: development
+      APP_PUBLIC_URL: http://localhost:8080
+    ports:
+      - "127.0.0.1:8000:8000"
+  worker:
+    environment:
+      APP_ENV: development
+      APP_PUBLIC_URL: http://localhost:8080
+  caddy:
+    environment:
+      APP_DOMAIN: ":8080"
+    ports: !override
+      - "127.0.0.1:8080:8080"

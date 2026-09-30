@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Qianyan · 代码地图</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#183d37;background:#f5f8f5;line-height:1.65}
+body{max-width:960px;margin:auto;padding:32px 22px}h1,h2,h3{line-height:1.25}h1{font-size:36px}
+.small{color:#546c65}.card{background:white;border:1px solid #d7e3dc;border-radius:16px;padding:20px;margin:16px 0}
+.flow{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.step{padding:16px;border-radius:12px;background:#edf5f0}
+code{font-family:ui-monospace,monospace;background:#edf3ef;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}
+pre{white-space:pre-wrap;background:#edf3ef;padding:14px}a{color:#176454}summary{cursor:pointer;font-weight:600}
+@media(max-width:600px){.flow{grid-template-columns:1fr}body{padding:20px 15px}h1{font-size:28px}}
+</style>
+<header><p class="small">Qianyan · 开发中的参考地图 · 2026-10-01</p><h1>一次证据变化，怎样变成下一步？</h1>
+<p>个人管家把目标、偏好和当前计划存到数据库。独立Worker持续观察并核对事实，形成清楚的计划变化。模型负责提出方案；后端负责验证和提交。</p></header>
+<main>
+<section class="card"><h2>跟着“部署失败”走三站</h2><p>这是可自行查阅的路线，尚未进行用户参与的导览。样例使用带标签的回放，真实接入另需账户配置。</p>
+<div class="flow" aria-label="回放入口到证据与计划，再到结果卡">
+<div class="step"><strong>1 · 触发事件</strong><p><code>frontend/src/App.tsx</code><br>搜索<code>/demo/events</code>。按钮发送回放事件；<code>backend/app/main.py → demo_event</code>写入持久任务。</p></div>
+<div class="step"><strong>2 · 核对与更新</strong><p><code>backend/app/worker.py → observe</code>加载证据。<code>planning.py → evaluate_progress</code>阻塞部署、创建排查任务、重新计算下一步。</p></div>
+<div class="step"><strong>3 · 看见结果</strong><p><code>main.py → state</code>读取当前任务、证据和Run。<code>App.tsx → ResultBody</code>把结果画成计划变化卡，样例通知只留在站内。</p></div>
+</div></section>
+<section class="card"><h2>主要组件</h2><ul>
+<li><code>frontend/src/</code>：中英文工作台、手机布局、设置/目标/记忆/通知。</li>
+<li><code>backend/app/main.py</code>：鉴权后的API、版本校验、企业微信回调。</li>
+<li><code>agent.py</code>：个人上下文、Nemotron函数调用、预算预留、PlanPatch验证。</li>
+<li><code>worker.py</code>：后台任务领取与恢复、观察、跟进、通知Outbox。</li>
+<li><code>planning.py</code>：README结构、CI SHA、部署状态等完成规则。</li>
+<li><code>db.py</code>：PostgreSQL模型；<code>adapters/</code>：受限的外部API。</li>
+<li><code>infra/compose.yaml</code>：Caddy、API、Worker、迁移与数据库。</li></ul></section>
+<section class="card"><h2>想改这里，从哪里开始</h2><ul>
+<li>页面文案和排版：<code>App.tsx</code>、<code>styles.css</code>。</li>
+<li>管家风格和默认通知窗口：<code>schemas.py → ButlerSettings</code>。</li>
+<li>“README什么时候才算完成”：<code>planning.py → readme_standard</code>。</li>
+<li>主动跟进频率：<code>worker.py → followup</code>；免打扰：<code>planning.py → next_contact</code>。</li>
+<li>来源读取：<code>adapters/github.py</code>、<code>adapters/vercel.py</code>。这里不决定任务Done。</li></ul></section>
+<section class="card"><h2>可复用的一条做法</h2><p>先把“观察到进展”和“完成任务”分开，再写明确完成标准。<code>tests/test_product.py → test_replay_closed_loop_and_dedup</code>验证：README出现但缺安装内容时不能Done，重复部署失败不能重复建排查任务或通知。类似做法也适用于其他会自主维护状态的Agent。</p></section>
+<section class="card"><h2>重新运行</h2><p>先按根目录<code>README.md</code>启动PostgreSQL并配置忽略的<code>.env</code>，分别打开三个终端：</p>
+<pre>cd backend
+uv sync --frozen
+uv run python -m app.migrate
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 第二个终端
+cd backend
+uv run python -m app.worker
+
+# 第三个终端
+cd frontend
+npm ci
+npm run dev</pre><p>打开<code>http://localhost:5173</code>。首次登录密码保存在忽略文件<code>.local/access.json</code>，不要发布。没有真实模型配置时页面会明确显示AI不可用。</p></section>
+<details class="card"><summary>当前证据的范围</summary><p>真实数据库和HTTP/Worker闭环已测试。模型契约使用MockTransport；微信协议使用官方已知答案向量。真实云端推理、来源账户、手机收发、生产容器、公网可用性与跨日使用尚未验收。这是开发快照，代码变更后地图可能需要更新。</p></details>
+</main>
+<footer class="small">离线文档，无脚本、CDN或联网依赖。对应首次开发检查点；源提交记录见Git历史。</footer>
+</html>
