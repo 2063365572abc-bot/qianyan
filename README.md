@@ -95,6 +95,8 @@ If WeCom is not configured yet, omit `--require-live-wecom`; the inbox can work,
 
 ## Usage
 
+Chinese walkthrough: [使用说明](devpost/user-guide.md). Component routes: [代码地图](devpost/app-map.html).
+
 Open `http://localhost:5173` after starting the API, worker and frontend. Choose the isolated demo to replay README and deployment events, or sign in using the generated local password in ignored `.local/access.json` to maintain your own goals.
 
 With a real model provider configured, delegate a goal such as “Help me finish this project by the end of the month.” Review the absolute deadline, task criteria and dependencies before confirming the draft. Without a model key, add manual tasks; the UI explicitly reports that inference is unavailable. Connect only your selected repository/project to observe actual provider facts.

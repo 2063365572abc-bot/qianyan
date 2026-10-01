@@ -39,7 +39,7 @@ Replay cases are product-behavior evidence, not live Vercel acceptance. Only Git
 - Backend: 138 PostgreSQL-backed/unit/contract tests passed; one upstream Starlette test-client deprecation warning.
 - Frontend: TypeScript + Vite production build passed.
 - Real local HTTP + API + independent worker: five journey groups passed after provider integration, including four replay transitions, settings/memory edit/forget, task states, export and owner/demo cookie isolation.
-- Prior published revision `55dcbe2`: [cloud CI](https://github.com/2063365572abc-bot/qianyan/actions/runs/36808370660) passed 129 backend tests, frontend build, and an actual Compose stack with Caddy HTTP journeys. The newest provider/UI changes are verified locally and will be published separately.
+- Published functional revision `3ef3edd`: [cloud CI](https://github.com/2063365572abc-bot/qianyan/actions/runs/36813046988) passed 138 backend tests, frontend build, and an actual Compose stack with Caddy HTTP journeys. These include the provider/UI changes and full-request context-budget regression. CI does not use the private model credential; real model proof above comes from the local independent worker.
 - Native PostgreSQL backup/restore remains independently verified: [backup notes](backup-notes.md).
 
 ## User access and remaining acceptance

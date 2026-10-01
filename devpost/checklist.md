@@ -18,7 +18,7 @@ Build mode: fast — 用户明确批准整套方案并委托完成实现、测�
 - [x] 独立 Worker、持久 jobs/outbox、GitHub 实际证据、明确标记的部署回放。
 - [x] 平台内收件箱；当前模式不会尝试微信发送或将其未配置视为平台故障。
 - [x] 138 项后端测试、前端构建；最新变更的真实 HTTP 与最终可视回归持续记录于 infra/platform-acceptance.md。
-- [x] 55dcbe2 云端 CI：129 项测试、前端构建、实际容器栈与 Caddy HTTP 五组闭环通过。
+- [x] 3ef3edd 云端 CI：138 项测试、前端构建、实际容器栈与 Caddy HTTP 五组闭环通过。
 - [ ] 用户本人实际使用后的反馈与验收（没有以代理测试代替）。
 
 当前模型联调证据：[平台验收记录](../infra/platform-acceptance.md)。比赛供应商、微信和公开部署的未验收项属于后续阶段。
@@ -77,9 +77,9 @@ Build mode: fast — 用户明确批准整套方案并委托完成实现、测�
 
 ## Code Tour and App Map
 
-- [ ] 实际代码的简明路线/使用说明完成。
+- [x] 实际代码的简明路线/使用说明完成：devpost/app-map.html 与 devpost/user-guide.md。
 - [ ] 可选学习/回顾按用户“做成项目”的偏好处理，不虚构学习记录。
-- [ ] devpost/app-map.html 从真实代码生成并展示。
+- [x] devpost/app-map.html 已按当前真实代码、模型和验收证据更新并提供查看入口（用户参与导览仍未完成）。
 
 ## Revisions
 
