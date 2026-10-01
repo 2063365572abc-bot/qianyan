@@ -12,6 +12,8 @@ The approved development baseline is in [Scope](devpost/scope.md), [PRD](devpost
 
 Fixture/demo evidence is labelled as a replay; it is not proof of a live integration. Production deployment, real Nebius account access, provider permissions and actual WeCom phone delivery require credentials and live acceptance. No cloud account or paid resource has been created by this repository. Docker Desktop failed to start on the development machine, so Compose configuration was checked but container builds and Docker backup/restore scripts have not been exercised locally.
 
+The [live GitHub acceptance](infra/live-github-evidence.md) records a published repository, successful cloud CI at the matching SHA, and objective task updates from actual GitHub observations. This closes the GitHub source check; it does not establish live Nemotron, Vercel, WeCom or public application deployment.
+
 技术验收与真正上线分别记录。没有真实账户联调的链路不能宣称已完成；关闭网页后的后台运行由独立 Worker 提供，不能用前端计时器代替。
 
 本地已实际运行 PostgreSQL 16.15、完成 0001 迁移、启动 API 与独立 Worker，健康检查显示数据库和后台在线；已恢复真实开发库快照到独立测试库。真实模型、数据源、企业微信及公开部署仍需账户联调，Docker 容器运行尚未实测。

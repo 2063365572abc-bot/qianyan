@@ -832,3 +832,19 @@ def test_close_important_changes_merge_with_current_evidence_only(product):
         assert len(notes) == 1 and notes[0].body["merged_events"] == 2
         assert len(notes[0].body["changes"]) == 3 and len(notes[0].body["evidence_ids"]) == 2
         assert all(db.get(Record, identity).active for identity in notes[0].body["evidence_ids"])
+
+
+def test_explicit_sync_does_not_create_multiple_periodic_poll_chains(product):
+    client, space_id = product()
+    goal = state(client)["goals"][0]
+    with SessionLocal.begin() as db:
+        first = queue(db, space_id, "observe", {}, goal["id"], now() + timedelta(minutes=5))
+        sooner = now() + timedelta(minutes=3)
+        same = queue(db, space_id, "observe", {}, goal["id"], sooner)
+        assert same.id == first.id and same.due_at == sooner
+        run = new_run(db, space_id, "observe", goal["id"])
+        explicit = queue(db, space_id, "observe", {"run_id": run.id}, goal["id"])
+        assert explicit.id != first.id
+        after_sync = queue(db, space_id, "observe", {}, goal["id"], now() + timedelta(minutes=5))
+        assert after_sync.id == first.id
+        assert len(list(db.scalars(select(Job).where(Job.goal_id == goal["id"], Job.kind == "observe", Job.status == "pending")))) == 2

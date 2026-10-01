@@ -96,10 +96,13 @@ async def publish(repo, branch):
             raise ValueError("Selected repository is not writable by the configured account")
         branches = await request("GET", "/branches?per_page=100")
         current = next((row["commit"]["sha"] for row in branches if row["name"] == branch), None)
+        known_blobs = set()
         if current:
             if current not in revisions:
                 raise ValueError("Remote branch has unrelated changes; native reconciliation required")
-            history = history[revisions.index(current) + 1:]
+            offset = revisions.index(current) + 1
+            known_blobs = {item["sha"] for _, _, rows in history[:offset] for item in rows}
+            history = history[offset:]
         bootstrap = None
         if not branches:
             # GitHub cannot create refs in a branchless repository. Initialize a
@@ -111,8 +114,9 @@ async def publish(repo, branch):
             bootstrap = (metadata["default_branch"], result["commit"]["sha"])
             if bootstrap[0] == branch:
                 raise ValueError("Bootstrap branch must differ from the selected local branch")
-        print(json.dumps({"stage": "publishing_objects", "commits": len(history), "blobs": len(blobs)}), flush=True)
-        uploaded = set()
+        needed = {item["sha"] for _, _, rows in history for item in rows} - known_blobs
+        print(json.dumps({"stage": "publishing_objects", "commits": len(history), "blobs": len(needed)}), flush=True)
+        uploaded = set(known_blobs)
         for sha, commit, rows in history:
             for item in rows:
                 identity = item["sha"]

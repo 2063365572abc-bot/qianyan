@@ -56,6 +56,23 @@ def queue(db, space_id, kind, payload, goal_id=None, due_at=None, key=None):
     exists = db.scalar(select(Job).where(Job.dedup_key == key))
     if exists:
         return exists
+    if kind == "observe" and goal_id and not payload.get("run_id"):
+        # Scheduled polls form one chain per goal. Explicit sync runs remain
+        # separate, but their completion must not create another endless chain.
+        pending = [job for job in db.scalars(select(Job).where(Job.goal_id == goal_id,
+            Job.kind == "observe", Job.status == "pending").order_by(Job.due_at, Job.id))
+            if job.payload.get("scheduled") or not job.payload.get("run_id")]
+        if pending:
+            primary = pending[0]
+            primary.payload = {**primary.payload, "scheduled": True}
+            primary.due_at = min(primary.due_at, due_at or now())
+            for duplicate in pending[1:]:
+                duplicate.status = "cancelled"
+                run = db.get(Run, duplicate.payload["run_id"]) if duplicate.payload.get("run_id") else None
+                if run and run.status in ("pending", "running"):
+                    run.status, run.error = "cancelled", "重复定时观察已合并 / Duplicate scheduled observation merged"
+            return primary
+        payload = {**payload, "scheduled": True}
     if kind == "followup" and goal_id:
         # One next follow-up per goal: snoozing or replanning replaces its schedule.
         for pending in db.scalars(select(Job).where(Job.goal_id == goal_id, Job.kind == "followup", Job.status == "pending")):
