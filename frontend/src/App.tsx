@@ -105,6 +105,7 @@ export default function App() {
   const [sourceGoal, setSourceGoal] = useState<Goal | null>(null);
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
   const [editingTask, setEditingTask] = useState<{ goal: Goal; task: Task } | null>(null);
+  const [snoozing, setSnoozing] = useState<Notification | null>(null);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [memoryEdit, setMemoryEdit] = useState<Memory | null>(null);
   const [memoryAdding, setMemoryAdding] = useState(false);
@@ -356,7 +357,7 @@ export default function App() {
     )
       setText("");
   };
-  const notificationAction = (item: Notification, action: string) =>
+  const notificationAction = (item: Notification, action: string, followupAt?: string) =>
     mutate(
       `/notifications/${item.id}/actions`,
       "POST",
@@ -369,7 +370,7 @@ export default function App() {
             }
           : {}),
         ...(action === "snooze"
-          ? { followup_at: new Date(Date.now() + 7200000).toISOString() }
+          ? { followup_at: followupAt || new Date(Date.now() + 7200000).toISOString() }
           : {}),
       },
       t("已记录你的选择", "Your choice was recorded"),
@@ -859,7 +860,7 @@ export default function App() {
                           </div>
                           <div className="deadline">
                             <Clock3 size={15} />
-                            {t("截止时间", "Deadline")} · {date(goal.deadline)}
+                            {t("截止时间", "Deadline")} · {date(goal.deadline)} · {state.space.settings.timezone}
                             <button
                               className="text-button"
                               onClick={() => setEditingGoal(goal)}
@@ -1519,6 +1520,9 @@ export default function App() {
                                   <Clock3 size={14} />
                                   {t("两小时后提醒", "Remind in 2h")}
                                 </button>
+                                <button className="text-button" disabled={busy} onClick={() => setSnoozing(item)}>
+                                  {t("自选提醒时间", "Choose reminder time")}
+                                </button>
                                 <button
                                   className="secondary compact"
                                   disabled={busy}
@@ -2107,6 +2111,26 @@ export default function App() {
               <Sparkles size={16} />
               {t("让管家提议计划", "Propose a plan")}
             </button>
+          </form>
+        </Modal>
+      )}
+      {snoozing && (
+        <Modal error={error} title={t("选择提醒时间", "Choose reminder time")} onClose={() => setSnoozing(null)}>
+          <form onSubmit={async (e) => {
+            e.preventDefault();
+            const form = new FormData(e.currentTarget);
+            const instant = new Date(String(form.get("followup_at"))).toISOString();
+            if (await notificationAction(snoozing, "snooze", instant)) setSnoozing(null);
+          }}>
+            <label>
+              {t("希望什么时候再找你？", "When should I follow up?")}
+              <input name="followup_at" type="datetime-local" required min={new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16)} />
+            </label>
+            <p className="fine-print">
+              {t("输入使用当前设备时区", "Enter a time in your device time zone")}: {Intl.DateTimeFormat().resolvedOptions().timeZone}。
+              {t("实际发送仍遵守你的联系时段。", "Delivery still respects your contact window.")}
+            </p>
+            <button className="primary wide" disabled={busy}>{t("安排跟进", "Schedule follow-up")}</button>
           </form>
         </Modal>
       )}

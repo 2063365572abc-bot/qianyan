@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from markdown_it import MarkdownIt
 from sqlalchemy import select
 from fastapi import HTTPException
-from .db import Space, Task, Record, Notification, Run, now, uid
+from .db import Space, Task, Record, Notification, Run, Job, now, uid
 from .services import serialize, update_risk, queue
 
 
@@ -88,9 +88,14 @@ def criterion_result(task, records, respect_user=True):
     return facts.get("exists"), "系统事实 / System fact", record
 
 
-def snapshot(db, goal):
-    return {"tasks": [serialize(t) for t in db.scalars(select(Task).where(Task.goal_id == goal.id))],
-            "next_action": goal.next_action, "risk": goal.risk}
+def snapshot(db, goal, include_schedule=False):
+    value = {"tasks": [serialize(t) for t in db.scalars(select(Task).where(Task.goal_id == goal.id))],
+             "next_action": goal.next_action, "risk": goal.risk}
+    if include_schedule:
+        value["scheduled_followups"] = [{"due_at": job.due_at.isoformat(),
+            "payload": {k: v for k, v in job.payload.items() if k not in ("run_id", "lease_token")}}
+            for job in db.scalars(select(Job).where(Job.goal_id == goal.id, Job.kind == "followup", Job.status == "pending"))]
+    return value
 
 
 def next_contact(settings, moment=None):
@@ -115,6 +120,41 @@ def notify(db, space, goal, category, reason_key, body, due_at=None):
     exists = db.scalar(select(Notification).where(Notification.space_id == space.id, Notification.reason_key == reason_key))
     if exists:
         return exists
+    if category == "action":
+        # Keep one unsent action reminder per goal across a closed contact window.
+        pending = db.scalar(select(Notification).where(Notification.goal_id == goal.id,
+            Notification.category == "action", Notification.send_state == "pending", Notification.action_state == "open")
+            .order_by(Notification.created_at.desc()).limit(1))
+        if pending:
+            pending.body = {"goal_title": goal.title, **body,
+                            "user_snooze": bool(pending.body.get("user_snooze") or body.get("user_snooze"))}
+            pending.due_at = next_contact(space.settings, max(pending.due_at, due_at or now()))
+            return pending
+    if category == "important_change" and space.role == "owner":
+        pending = db.scalar(select(Notification).where(Notification.goal_id == goal.id,
+            Notification.category == category, Notification.send_state == "pending", Notification.action_state == "open",
+            Notification.created_at >= now() - timedelta(minutes=1)).order_by(Notification.created_at.desc()).limit(1))
+        if pending:
+            rows = {t.id: t for t in db.scalars(select(Task).where(Task.goal_id == goal.id))}
+            records = list(db.scalars(select(Record).where(Record.goal_id == goal.id, Record.kind == "evidence", Record.active.is_(True))))
+            changes = {c["task_id"]: c for c in pending.body.get("changes", [])}
+            changes.update({c["task_id"]: c for c in body.get("changes", [])})
+            current, citations = [], set()
+            for identity, change in changes.items():
+                task = rows.get(identity)
+                if not task or task.status != change.get("after", {}).get("status"):
+                    continue
+                checked = rows.get(task.criteria.get("blocker_for")) or task
+                passed, _, record = criterion_result(checked, records)
+                if passed is None or not record:
+                    continue
+                current.append({**change, "after": serialize(task)})
+                citations.add(record.id)
+            pending.body = {"goal_title": goal.title, **body, "changes": current,
+                            "evidence_ids": sorted(citations), "merged_events": pending.body.get("merged_events", 1) + 1}
+            return pending
+        if due_at is None:
+            due_at = now() + timedelta(minutes=1)
     note = Notification(id=uid(), space_id=space.id, goal_id=goal.id, category=category, reason_key=reason_key,
                         body={"goal_title": goal.title, **body}, due_at=next_contact(space.settings, due_at),
                         send_state="in_app" if space.role == "demo" or not space.settings.get("proactive", True) else "pending")
@@ -246,11 +286,21 @@ def undo_latest(db, goal):
         else:
             before = old_tasks[task.id]
             for field in ("status", "priority", "depends_on", "criteria", "title", "estimate_hours", "followup_at"):
-                if field == "followup_at" and before.get(field):
-                    before[field] = datetime.fromisoformat(before[field])
-                setattr(task, field, before[field])
+                value = before[field]
+                if field == "followup_at" and value:
+                    value = datetime.fromisoformat(value)
+                setattr(task, field, value)
     goal.plan_version += 1
     run.metrics = {**run.metrics, "undone": True}
+    previous_schedule = run.metrics["before"].get("scheduled_followups")
+    if previous_schedule is not None:
+        for pending in db.scalars(select(Job).where(Job.goal_id == goal.id, Job.kind == "followup", Job.status == "pending")):
+            pending.status = "cancelled"
+        if goal.status == "active":
+            for index, item in enumerate(previous_schedule):
+                due = max(now(), datetime.fromisoformat(item["due_at"]))
+                queue(db, goal.space_id, "followup", item["payload"], goal.id, due,
+                      f"followup:{goal.id}:{goal.plan_version}:undo:{index}")
     update_risk(db, goal)
     # Recheck even if the provider returns exactly the same evidence next time.
     # Keep undo visible briefly, then reconcile facts without repeating a push.

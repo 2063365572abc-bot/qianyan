@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from app import agent, main, planning, worker
 from app.adapters import Observation, WeComAdapter
-from app.db import Goal, Record, Task
+from app.db import Goal, Record, Task, Job, Notification
 from app.schemas import SourceChange, VercelBinding
 
 
@@ -27,6 +27,8 @@ class MemorySession:
             return self.tasks
         if entity is Record:
             return self.records
+        if entity is Job:
+            return []
         raise AssertionError(f"Unexpected entity: {entity}")
 
     def scalar(self, statement):
@@ -105,6 +107,19 @@ def test_snapshot_reads_cannot_select_another_space_goal_or_record():
                             ("shell", {})):
         with pytest.raises(ValueError):
             agent.read_snapshot(context, name, arguments)
+
+
+def test_notification_uses_personal_name_and_style_without_changing_facts():
+    current = goal()
+    current.deadline = datetime(2026, 10, 30, 10, tzinfo=timezone.utc)
+    note = Notification(body={"title": "Production failed", "next_action": "Inspect build log", "risk": "Blocked"})
+    texts = {style: worker.notification_text(note, current, {"name": "我的管家", "style": style, "timezone": "Asia/Shanghai"})
+             for style in ("concise", "warm", "detailed")}
+    for output in texts.values():
+        assert output.startswith("我的管家：") and "Production failed" in output and "Inspect build log" in output and "Blocked" in output
+        assert len(output.encode("utf-8")) <= 2048
+    assert "I’m following up" in texts["warm"] and "2026-10-30T18:00:00+08:00" in texts["detailed"]
+    assert len(set(texts.values())) == 3
 
 
 def test_model_cannot_use_commit_success_as_subjective_mvp_acceptance():

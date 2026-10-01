@@ -505,7 +505,12 @@ def notification_action(note_id: str, body: NotificationAction, request: Request
         due = body.followup_at or now() + timedelta(hours=2)
         if due.tzinfo is None or due <= now():
             raise HTTPException(422, "请选择带时区的未来时间 / Choose a future time with timezone")
-        queue(db, space.id, "followup", {"notification_id": note.id}, note.goal_id, due)
+        if goal:
+            check_version(goal, body.version)
+            if goal.status != "active":
+                raise HTTPException(409, "目标未在跟进中 / Goal is not active")
+            goal.plan_version += 1
+        queue(db, space.id, "followup", {"notification_id": note.id, "user_snooze": True}, note.goal_id, due)
     elif body.action == "mark_done":
         task_id = note.body.get("task_id")
         task = db.get(Task, task_id) if task_id else None

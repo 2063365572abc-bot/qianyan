@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 from datetime import timedelta
-from sqlalchemy import select, or_, and_, delete, func
+from sqlalchemy import select, or_, and_, delete, func, text as sql_text
 from .config import config
 from .db import SessionLocal, Space, AccessSession, Goal, Task, Record, Run, Job, Notification, now, uid
 from .services import (queue, new_run, add_record, owned_goal, install_initial_plan,
@@ -16,6 +16,7 @@ from .planning import (store_observations, evaluate_progress, next_contact, noti
 from .agent import build_context, context_revision, generate, apply_patch, ResponseProposal
 from .schemas import InitialPlan
 from .services import confirm_task
+from .dates import deadline_hint, candidate_text
 from .adapters import GitHubAdapter, VercelAdapter, WeComAdapter, Observation, AdapterError
 
 log = logging.getLogger("qianyan.worker")
@@ -200,12 +201,12 @@ async def model_followup(job_id, token, ctx, rev, run_id, purpose):
                         raise ValueError("Up to three active goals")
                     if response.capture_goal.deadline:
                         record = db.get(Record, job.payload.get("record_id"))
+                        if not record:
+                            raise ValueError("Deadline requires an actual user message")
                         user_text = record.body.get("text", "") if record else ""
-                        local = response.capture_goal.deadline.astimezone(__import__("zoneinfo").ZoneInfo(space.settings["timezone"]))
-                        month, day = local.month, local.day
-                        date_pattern = rf"(?:{local.year}[-/]0?{month}[-/]0?{day}|(?:{local.year}年)?0?{month}月0?{day}日)"
-                        if not re.search(date_pattern, user_text):
-                            raise ValueError("No explicit matching calendar date; use null deadline and ask the user")
+                        hint = deadline_hint(user_text, space.settings["timezone"], record.created_at)
+                        if hint.get("status") != "candidate" or response.capture_goal.deadline != __import__("datetime").datetime.fromisoformat(hint["deadline"]):
+                            raise ValueError("Use the exact server deadline candidate, or null and ask for clarification")
         response = await generate(run_id, ctx, ResponseProposal, purpose, validator=validate)
         with SessionLocal.begin() as db:
             job, space, goal, run = load_claim(db, job_id, token)
@@ -217,22 +218,30 @@ async def model_followup(job_id, token, ctx, rev, run_id, purpose):
                 original_before = run.metrics.get("before")
                 apply_patch(db, goal, response.patch, run)
                 if original_before:
-                    run.metrics = {**run.metrics, "before": original_before}
+                    run.metrics = {**run.metrics, "before": {**run.metrics["before"], **original_before}}
             if response.capture_goal:
                 delegated = response.capture_goal
+                record = db.get(Record, job.payload.get("record_id"))
+                hint = deadline_hint(record.body.get("text", ""), space.settings["timezone"], record.created_at) if record else {}
+                # Only this unconfirmed draft gets a date candidate; existing hard
+                # deadlines are never changed by a model proposal.
+                deadline = __import__("datetime").datetime.fromisoformat(hint["deadline"]) if hint.get("status") == "candidate" else None
                 goal = Goal(id=uid(), space_id=space.id, title=delegated.title,
-                    intent=delegated.intent, deadline=delegated.deadline, status="draft")
+                    intent=delegated.intent, deadline=deadline, status="draft")
                 db.add(goal)
                 db.flush()
                 run.goal_id, job.goal_id = goal.id, goal.id
-                record = db.get(Record, job.payload.get("record_id"))
                 if record:
                     # Preserve the actual human instruction rather than inferred intent.
                     goal.intent, record.goal_id = record.body["text"], goal.id
                 initial = new_run(db, space.id, "initial_plan", goal.id)
                 queue(db, space.id, "initial_plan", {"run_id": initial.id}, goal.id)
                 run.patch = {"title": "目标草稿已保存 / Goal draft saved", "goal_id": goal.id,
-                    "reason": "初始计划生成后仍需你确认 / Review and confirm the initial plan"}
+                    "reason": "初始计划生成后仍需你确认 / Review and confirm the initial plan",
+                    "deadline_candidate": hint}
+                notice = candidate_text(hint)
+                if notice:
+                    response.reply = response.reply + "\n\n" + notice
             add_record(db, space.id, "message", {"role": "assistant", "text": response.reply,
                 "type": "proposal_explanation", "run_id": run.id,
                 "context_memory_ids": ctx.get("memory_dependencies", [])}, goal.id if goal else None, "agent")
@@ -264,7 +273,8 @@ def explicit_command(db, space, goal, record):
         return "已暂停该目标的自动观察和提醒。 / This goal's observation and follow-up are paused."
     if goal and text in ("稍后提醒", "/snooze"):
         live_goal(goal)
-        queue(db, space.id, "followup", {}, goal.id, now() + timedelta(hours=2), "snooze:" + record.id)
+        goal.plan_version += 1
+        queue(db, space.id, "followup", {"user_snooze": True}, goal.id, now() + timedelta(hours=2), "snooze:" + record.id)
         for note in db.scalars(select(Notification).where(Notification.goal_id == goal.id, Notification.action_state == "open")):
             note.action_state = "snooze"
             if note.send_state == "pending":
@@ -344,20 +354,29 @@ async def followup(job_id, token):
             task = next((t for t in sorted(active, key=lambda t: (t.priority, t.id)) if t.title == goal.next_action), None)
             notify(db, space, goal, "action", "followup:" + job.id, {"title": "下一步需要你行动 / Your next action",
                 "text": goal.next_action, "task_id": task.id if task else None, "risk": goal.risk,
-                "next_action": goal.next_action, "deadline": goal.deadline.isoformat() if goal.deadline else None})
+                "next_action": goal.next_action, "deadline": goal.deadline.isoformat() if goal.deadline else None,
+                "user_snooze": job.payload.get("user_snooze", False)})
         run.status, run.patch = "succeeded", {"title": "跟进已检查 / Follow-up checked", "next_action": goal.next_action, "risk": goal.risk}
         due = now() + timedelta(hours=4)
         queue(db, space.id, "followup", {}, goal.id, due, f"followup:{goal.id}:{job.id}")
 
 
-def notification_text(note, goal):
+def notification_text(note, goal, settings=None):
+    settings = settings or {}
+    style = settings.get("style", "concise")
+    name = settings.get("name", "Qianyan")
     body = note.body
-    lines = ["Qianyan：" + goal.title, str(body.get("title") or "目标进度有变化 / Goal update")]
+    lines = [name + "：" + goal.title, str(body.get("title") or "目标进度有变化 / Goal update")]
+    if style == "warm":
+        lines.append("我在继续跟进，下面是需要你留意的信息。 / I’m following up; here is what needs your attention.")
     if body.get("text"):
         lines.append(str(body["text"])[:450])
-    for change in body.get("changes", [])[:3]:
+    for change in body.get("changes", [])[:10 if style == "detailed" else 3]:
         after = change.get("after", {})
         lines.append(str(change.get("title", ""))[:80] + " → " + str(after.get("status", "updated")))
+    if style == "detailed" and goal.deadline:
+        zone = __import__("zoneinfo").ZoneInfo(settings.get("timezone", "Asia/Shanghai"))
+        lines.append("截止时间 / Deadline: " + goal.deadline.astimezone(zone).isoformat() + " (" + str(zone) + ")")
     lines.extend(["下一步 / Next: " + str(body.get("next_action") or goal.next_action)[:180],
                   "状态 / Risk: " + str(body.get("risk") or goal.risk)[:160],
                   config().app_public_url.rstrip("/") + "/?goal=" + goal.id])
@@ -413,9 +432,28 @@ async def send_one_notification():
             if not task or task.goal_id != goal.id or task.status in ("done", "skipped", "blocked"):
                 note.send_state = "cancelled"
                 return True
+        if note.category == "action" and not note.body.get("user_snooze"):
+            # Serialize action-send reservations for this goal, including separate
+            # worker processes. Network I/O happens only after the reservation commits.
+            db.execute(sql_text("SELECT pg_advisory_xact_lock(:key)"), {"key": int(fingerprint(goal.id)[:15], 16)})
+            recent = list(db.scalars(select(Notification).where(Notification.goal_id == goal.id,
+                Notification.id != note.id, Notification.category == "action",
+                Notification.action_state == "open", Notification.send_state.in_(("sending", "accepted", "delivery_unknown")))))
+            instants = []
+            for previous in recent:
+                stamp = previous.body.get("send_started_at")
+                try:
+                    value = __import__("datetime").datetime.fromisoformat(stamp) if stamp else previous.created_at
+                    if value.tzinfo:
+                        instants.append(value)
+                except (ValueError, TypeError):
+                    pass
+            if instants and max(instants) + timedelta(hours=4) > now():
+                note.due_at = next_contact(space.settings, max(instants) + timedelta(hours=4))
+                return True
         note.send_state, note.attempts = "sending", note.attempts + 1
         note.body = {**note.body, "send_started_at": now().isoformat()}
-        note_id, text = note.id, notification_text(note, goal)
+        note_id, text = note.id, notification_text(note, goal, space.settings)
     adapter = None
     try:
         adapter = wecom_adapter()

@@ -11,6 +11,7 @@ from .schemas import StrictModel, InitialPlan, PlanTask, GoalInput
 from .services import goal_detail, serialize, check_version, update_risk, queue, validate_dependencies
 from .planning import snapshot, criterion_result, fingerprint, notify
 from .adapters import TokenFactoryAdapter, AdapterError
+from .dates import deadline_hint
 
 
 class TaskProposal(StrictModel):
@@ -48,6 +49,7 @@ never prove subjective MVP acceptance. A failed build doesn't prove old producti
 Do not change deadlines, invent capacity, user decisions, observed progress or healthy URLs.
 When the user explicitly delegates a new long-term goal and no goal is selected, you may
 return capture_goal to save an unconfirmed draft. Otherwise leave capture_goal null.
+Use only the server's deadline_hint for a new draft's relative date; ask if ambiguous.
 Use null deadline if no precise user-provided deadline; ask for it. The user must review
 and confirm the draft plan; saving a draft does not authorize external execution.
 Avoid needless changes, duplicate tasks and routine commit notifications. Dependencies must
@@ -79,6 +81,9 @@ def build_context(db, space, goal=None):
                      for r in reversed(messages)], "data_mode": "replay" if space.role == "demo" else "live"}
     value["memory_dependencies"] = sorted({r.id for r in memories} | {
         identity for r in messages for identity in r.body.get("context_memory_ids", [])})
+    latest_user = next((r for r in messages if r.body.get("role") == "user"), None)
+    if latest_user:
+        value["deadline_hint"] = deadline_hint(latest_user.body.get("text", ""), space.settings["timezone"], latest_user.created_at)
     if goal:
         detail = goal_detail(db, goal)
         detail["intent"] = detail["intent"][:1200]
@@ -305,7 +310,7 @@ def apply_patch(db, goal, patch: PlanPatch, run=None, user_confirmed_ids=(), dry
         raise ValueError("Follow-up must be a bounded future timezone-aware instant")
     if dry_run:
         return True
-    before = snapshot(db, goal)
+    before = snapshot(db, goal, include_schedule=True)
     for change in patch.changes:
         task = tasks[change.task_id]
         for field in ("status", "priority", "depends_on"):
@@ -319,7 +324,7 @@ def apply_patch(db, goal, patch: PlanPatch, run=None, user_confirmed_ids=(), dry
             criteria=new.criteria, depends_on=[new_ids.get(d, d) for d in new.depends_on], estimate_hours=new.estimate_hours))
     update_risk(db, goal)
     after = snapshot(db, goal)
-    changed = before != after or bool(patch.followup_at)
+    changed = {k: v for k, v in before.items() if k != "scheduled_followups"} != after or bool(patch.followup_at)
     if changed:
         goal.plan_version += 1
         if patch.followup_at:

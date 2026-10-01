@@ -662,6 +662,7 @@ async def test_deployment_failure_can_notify_without_log_permission(product, mon
         note = db.scalar(select(Notification).where(Notification.goal_id == goal.id))
         assert task.status == "blocked" and note.category == "important_change"
         assert len(note.body["evidence_ids"]) == 1  # Unrelated partial CI is not a dependency.
+        note.due_at = now()  # Advance the explicit one-minute coalescing window for this send test.
         note_id = note.id
     sent = []
     class WeComMock:
@@ -674,3 +675,160 @@ async def test_deployment_failure_can_notify_without_log_permission(product, mon
     with SessionLocal() as db:
         assert db.get(Notification, note_id).send_state == "accepted"
     assert len(sent) == 1 and "blocked" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_relative_deadline_is_anchored_to_message_and_stays_unconfirmed(product, monkeypatch):
+    import json
+    import httpx
+    from app.adapters import TokenFactoryAdapter
+    client, space_id = product("owner")
+    anchor = datetime(2026, 10, 1, 16, 30, tzinfo=timezone.utc)  # October 2 in Shanghai.
+    def respond(request):
+        context = json.loads(json.loads(request.content)["messages"][1]["content"])
+        assert context["deadline_hint"]["date"] == "2026-10-03"
+        proposal = {"reply": "我已保存草稿，请确认日期。", "capture_goal": {"title": "交报名材料", "intent": "Prepare materials", "deadline": None}}
+        return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [{"id": "call", "type": "function",
+            "function": {"name": "propose_plan_patch", "arguments": json.dumps(proposal)}}]}}], "model": "nvidia/mock-nemotron"})
+    monkeypatch.setattr(config(), "nebius_api_key", "mock-key")
+    monkeypatch.setattr("app.agent.TokenFactoryAdapter", lambda key, model, base: TokenFactoryAdapter(key, model, base, transport=httpx.MockTransport(respond)))
+    client.post("/api/messages", json={"text": "明天必须把报名材料准备好，请帮我一直跟进。"})
+    with SessionLocal.begin() as db:
+        job = db.scalar(select(Job).where(Job.space_id == space_id, Job.kind == "message"))
+        db.get(Record, job.payload["record_id"]).created_at = anchor
+        job_id = job.id
+    await run_test_job(job_id)
+    result = state(client)
+    goal = result["goals"][0]
+    assert goal["status"] == "draft" and datetime.fromisoformat(goal["deadline"]) == datetime(2026, 10, 3, 15, 59, 59, tzinfo=timezone.utc)
+    assert "2026-10-03" in str(result["messages"]) and "Asia/Shanghai" in str(result["messages"])
+    assert "No exact time" in str(result["messages"])
+    with SessionLocal() as db:
+        assert not list(db.scalars(select(Job).where(Job.goal_id == goal["id"], Job.kind == "followup", Job.status == "pending")))
+
+
+def test_undo_restores_previous_followup_schedule(product):
+    from app.agent import apply_patch, PlanPatch
+    client, space_id = product()
+    goal = state(client)["goals"][0]
+    original_time, changed_time = now() + timedelta(hours=5), now() + timedelta(hours=8)
+    with SessionLocal.begin() as db:
+        current = db.get(Goal, goal["id"])
+        task = db.scalar(select(Task).where(Task.goal_id == current.id))
+        task.followup_at = original_time
+        task_id = task.id
+        original = queue(db, space_id, "followup", {"user_snooze": True}, current.id, original_time)
+        run = new_run(db, space_id, "message", current.id)
+        proposal = PlanPatch(goal_id=current.id, base_plan_version=current.plan_version, followup_at=changed_time,
+                             reason="Move the next follow-up")
+        assert apply_patch(db, current, proposal, run)
+        run.status = "succeeded"
+        version, old_job_id = current.plan_version, original.id
+    response = client.post("/api/goals/" + goal["id"] + "/undo", json={"version": version})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        jobs = list(db.scalars(select(Job).where(Job.goal_id == goal["id"], Job.kind == "followup", Job.status == "pending")))
+        assert len(jobs) == 1 and jobs[0].due_at == original_time
+        assert jobs[0].payload == {"user_snooze": True} and jobs[0].id != old_job_id
+        assert db.get(Task, task_id).followup_at == original_time
+
+
+@pytest.mark.asyncio
+async def test_quiet_window_coalesces_repeated_unsent_followups(product, monkeypatch):
+    client, space_id = product("owner")
+    quiet = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)  # 23:00 Shanghai.
+    monkeypatch.setattr("app.planning.now", lambda: quiet)
+    with SessionLocal.begin() as db:
+        goal = Goal(id=uid(), space_id=space_id, title="Prepare", intent="Prepare material", status="active")
+        db.add(goal)
+        db.flush()
+        db.add(Task(id=uid(), goal_id=goal.id, title="Collect documents", criteria={"kind": "user"}, depends_on=[]))
+        goal_id = goal.id
+    for _ in range(3):
+        with SessionLocal.begin() as db:
+            job_id = queue(db, space_id, "followup", {}, goal_id).id
+        await run_test_job(job_id)
+    with SessionLocal() as db:
+        notes = list(db.scalars(select(Notification).where(Notification.goal_id == goal_id)))
+        assert len(notes) == 1 and notes[0].send_state == "pending"
+        assert notes[0].body["next_action"] == "Collect documents"
+        assert notes[0].due_at == datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_unhandled_action_reminder_is_throttled_but_user_snooze_is_respected(product, monkeypatch):
+    client, space_id = product("owner")
+    stamp = now() - timedelta(hours=1)
+    with SessionLocal.begin() as db:
+        space = db.get(Space, space_id)
+        space.settings = {**space.settings, "notification_start": "00:00", "notification_end": "00:00"}
+        goal = Goal(id=uid(), space_id=space_id, title="Prepare", intent="Prepare", status="active", next_action="Collect docs")
+        db.add(goal)
+        db.flush()
+        previous = Notification(id=uid(), space_id=space_id, goal_id=goal.id, category="action", reason_key=uid(),
+            body={"send_started_at": stamp.isoformat()}, due_at=stamp, send_state="accepted")
+        pending = Notification(id=uid(), space_id=space_id, goal_id=goal.id, category="action", reason_key=uid(),
+            body={"next_action": "Collect docs"}, due_at=now(), send_state="pending")
+        db.add_all([previous, pending])
+        note_id = pending.id
+    def forbidden():
+        raise AssertionError("Four-hour interval must be checked before provider I/O")
+    monkeypatch.setattr("app.worker.wecom_adapter", forbidden)
+    assert await send_one_notification()
+    with SessionLocal.begin() as db:
+        pending = db.get(Notification, note_id)
+        assert pending.send_state == "pending" and pending.due_at == stamp + timedelta(hours=4)
+        pending.body = {**pending.body, "user_snooze": True}
+        pending.due_at = now()
+    sent = []
+    class WeComMock:
+        async def send_text(self, text):
+            sent.append(text)
+            return {"provider_id": "mock"}
+        async def aclose(self): pass
+    monkeypatch.setattr("app.worker.wecom_adapter", lambda: WeComMock())
+    assert await send_one_notification()
+    assert len(sent) == 1
+
+
+def test_custom_snooze_checks_version_and_invalidates_old_auto_proposals(product):
+    client, space_id = product()
+    goal = state(client)["goals"][0]
+    due = now() + timedelta(hours=3)
+    with SessionLocal.begin() as db:
+        note = Notification(id=uid(), space_id=space_id, goal_id=goal["id"], category="action", reason_key=uid(),
+            body={"next_action": goal["next_action"]}, due_at=now(), send_state="in_app")
+        db.add(note)
+        note_id = note.id
+    path = "/api/notifications/" + note_id + "/actions"
+    assert client.post(path, json={"action": "snooze", "followup_at": due.isoformat()}).status_code == 409
+    response = client.post(path, json={"action": "snooze", "followup_at": due.isoformat(), "version": goal["plan_version"]})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        assert db.get(Goal, goal["id"]).plan_version == goal["plan_version"] + 1
+        job = db.scalar(select(Job).where(Job.goal_id == goal["id"], Job.kind == "followup", Job.status == "pending"))
+        assert job.due_at == due and job.payload["user_snooze"] is True
+
+
+def test_close_important_changes_merge_with_current_evidence_only(product):
+    from app.worker import replay_observation
+    client, space_id = product("owner")
+    with SessionLocal.begin() as db:
+        space = db.get(Space, space_id)
+        space.settings = {**space.settings, "notification_start": "00:00", "notification_end": "00:00"}
+        goal = Goal(id=uid(), space_id=space_id, title="Project", intent="Ship demo", status="active")
+        db.add(goal)
+        db.flush()
+        db.add_all([Task(id=uid(), goal_id=goal.id, title="README", criteria={"kind": "readme"}, depends_on=[]),
+                    Task(id=uid(), goal_id=goal.id, title="Deploy", criteria={"kind": "deployment"}, depends_on=[])])
+        db.flush()
+        store_observations(db, goal, [replay_observation("readme_complete")])
+        evaluate_progress(db, goal)
+        first = db.scalar(select(Notification).where(Notification.goal_id == goal.id))
+        assert first.due_at > now()
+        store_observations(db, goal, [replay_observation("deployment_failed")])
+        evaluate_progress(db, goal)
+        notes = list(db.scalars(select(Notification).where(Notification.goal_id == goal.id)))
+        assert len(notes) == 1 and notes[0].body["merged_events"] == 2
+        assert len(notes[0].body["changes"]) == 3 and len(notes[0].body["evidence_ids"]) == 2
+        assert all(db.get(Record, identity).active for identity in notes[0].body["evidence_ids"])

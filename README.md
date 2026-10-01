@@ -1,5 +1,7 @@
 # Qianyan / 千言
 
+## Overview
+
 A persistent personal AI butler: tell it a goal once, then let it maintain the plan, remember context, follow up and explain changes with evidence. Qianyan updates its own tasks; it does not edit your repository, deploy code, pay, submit forms or email other people.
 
 千言是持续在云端工作的个人管家：交代一次目标，维护计划、记忆与跟进。核心路径是个人设置 → 交代目标 → 确认计划 → 后台跟进 → 回复后调整 → 下次仍记得。GitHub/Vercel 是可选的只读进度来源。
@@ -22,7 +24,7 @@ Fixture/demo evidence is labelled as a replay; it is not proof of a live integra
 - Read-only GitHub/Vercel adapters and separate WeCom notification adapter.
 - Caddy serves the built frontend and proxies API/callbacks on the same origin. No GPU required.
 
-## Local development
+## Installation
 
 Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), Node.js 24, Docker with Compose 2.24.4+ and a working Linux engine.
 
@@ -88,6 +90,14 @@ If WeCom is not configured yet, omit `--require-live-wecom`; the inbox can work,
 8. Back up and rehearse restoration using [backup notes](infra/backup-notes.md). Keep the publicly accessible demo alive for the contest judging period, subject to the final contest dates.
 
 正式环境：域名与服务器需用户实际账户；模型额度、可信出口 IP、企业微信成员可见范围、手机外链都要真实核验。默认基础架构不包含高可用、自动异地备份或成本保障。
+
+## Usage
+
+Open `http://localhost:5173` after starting the API, worker and frontend. Choose the isolated demo to replay README and deployment events, or sign in using the generated local password in ignored `.local/access.json` to maintain your own goals.
+
+With Nebius configured, delegate a goal such as “Help me finish this project by the end of the month.” Review the absolute deadline, task criteria and dependencies before confirming the draft. Without a model key, add manual tasks; the UI explicitly reports that inference is unavailable. Connect only your selected repository/project to observe actual provider facts.
+
+The worker continues while the webpage is closed. Real phone delivery requires the configured official WeCom application. Replay notifications remain inside the demo and never contact your real account.
 
 ## Verification commands
 
