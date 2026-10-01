@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from .types import AdapterError, HTTPAdapter, Observation, fingerprint, redact
+from .health import probe_https
 
 
 def _provider_url(value: object) -> str | None:
@@ -43,13 +44,14 @@ class VercelAdapter(HTTPAdapter):
     def __init__(
         self, token: str, *, client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        base_url: str = "https://api.vercel.com", timeout: float = 20.0,
+        base_url: str = "https://api.vercel.com", timeout: float = 20.0, health_probe=None,
     ):
         if not token:
             raise AdapterError("configuration", "A Vercel read token is required.")
         super().__init__(base_url, client=client, transport=transport, timeout=timeout)
         self._token = token
         self._headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        self._health_probe = health_probe or (probe_https if transport is None and client is None else None)
 
     async def observe(self, project_id: str, team_id: str | None = None) -> list[Observation]:
         if not project_id or len(project_id) > 200 or (team_id is not None and len(team_id) > 200):
@@ -120,6 +122,7 @@ class VercelAdapter(HTTPAdapter):
                     log_status, partial = exc.code, True
             facts = {
                 "kind": "deployment", "role": role, "project_id": project_id, "observed": True,
+                "completion_evidence_complete": True,
                 "deployment_id": uid, "target": "production", "state": state,
                 "deployment_url": deployment_url, "production_url": alias_urls[0] if alias_urls else None,
                 "aliases": alias_urls, "health": "not_observed", "current_routing": "not_observed",
@@ -127,6 +130,10 @@ class VercelAdapter(HTTPAdapter):
                 "build_log_status": log_status, "build_log_excerpt": excerpt,
                 "meaning": "latest_production_attempt" if role == "latest" else "previous_ready_deployment_not_verified_live",
             }
+            if alias_urls and self._health_probe:
+                allowed = {urlsplit(u).hostname for u in alias_urls}
+                facts["health"] = await self._health_probe(alias_urls[0], allowed)
+                facts["health_url"] = alias_urls[0]
             updated = _time(detail.get("updatedAt") or detail.get("ready") or detail.get("createdAt") or row.get("created"))
             observations.append(Observation("vercel", project_id + ":" + role, fingerprint(facts), facts, updated, deployment_url, partial))
         return observations

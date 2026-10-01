@@ -77,6 +77,8 @@ def build_context(db, space, goal=None):
                       "source": r.source} for r in memories],
         "messages": [{"id": r.id, "role": r.body.get("role"), "text": r.body.get("text", "")[:2000]}
                      for r in reversed(messages)], "data_mode": "replay" if space.role == "demo" else "live"}
+    value["memory_dependencies"] = sorted({r.id for r in memories} | {
+        identity for r in messages for identity in r.body.get("context_memory_ids", [])})
     if goal:
         detail = goal_detail(db, goal)
         detail["intent"] = detail["intent"][:1200]
@@ -139,32 +141,93 @@ def reserve_call(run_id, input_tokens):
             "daily_reserved_tokens": (run.metrics.get("daily_reserved_tokens", 0) if run.metrics.get("budget_day") == day else 0) + reservation}
 
 
+READ_TOOLS = ("get_goal", "list_tasks", "read_evidence", "read_memory")
+
+
+def snapshot_tools():
+    tools = []
+    for name in READ_TOOLS:
+        properties = {"ids": {"type": "array", "items": {"type": "string"}, "maxItems": 30}} if name.startswith("read_") else {}
+        tools.append({"type": "function", "function": {"name": name,
+            "description": "Read only the current space's bounded context snapshot; no network or side effects",
+            "parameters": {"type": "object", "properties": properties, "additionalProperties": False}}})
+    return tools
+
+
+def read_snapshot(context, name, arguments):
+    """Never query another goal/space or fetch a model-supplied URL."""
+    if name not in READ_TOOLS or not isinstance(arguments, dict):
+        raise ValueError("Unknown snapshot tool")
+    if set(arguments) - ({"ids"} if name.startswith("read_") else set()):
+        raise ValueError("Snapshot tool cannot choose a space or another goal")
+    goal = context.get("goal")
+    if name == "get_goal":
+        return {k: v for k, v in goal.items() if k not in ("tasks", "evidence")} if goal else {"selected_goal": None, "goals": context.get("goals", [])}
+    if name == "list_tasks":
+        return goal.get("tasks", []) if goal else []
+    rows = context.get("memories", []) if name == "read_memory" else (goal.get("evidence", []) if goal else [])
+    if "ids" in arguments:
+        ids = arguments["ids"]
+        if not isinstance(ids, list) or len(ids) > 30 or any(not isinstance(identity, str) for identity in ids):
+            raise ValueError("Read IDs must be a bounded list of strings")
+        if not set(ids).issubset({row["id"] for row in rows}):
+            raise ValueError("Read IDs must belong to this context snapshot")
+        rows = [row for row in rows if row["id"] in ids]
+    return rows
+
+
 async def generate(run_id, context, schema, purpose, validator=None):
     cfg = config()
     if not cfg.nebius_api_key:
         raise AdapterError("configuration", "Nebius Token Factory 未配置；事实同步和手动计划仍可用 / Model not configured")
-    adapter = TokenFactoryAdapter(cfg.nebius_api_key, cfg.nebius_model_id, cfg.nebius_base_url)
     if not cfg.nebius_model_id.lower().startswith("nvidia/"):
         raise AdapterError("configuration", "An NVIDIA Nemotron model is required")
+    adapter = TokenFactoryAdapter(cfg.nebius_api_key, cfg.nebius_model_id, cfg.nebius_base_url)
     name = "propose_plan" if schema is InitialPlan else "propose_plan_patch"
     messages = [{"role": "system", "content": SYSTEM + "\nTask: " + purpose},
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)}]
-    tools = [{"type": "function", "function": {"name": name, "description": "Return a bounded proposal for backend validation",
+    tools = snapshot_tools() + [{"type": "function", "function": {"name": name, "description": "Return a bounded proposal for backend validation",
               "parameters": schema.model_json_schema()}}]
+    proposal_names = {name}
+    if schema is ResponseProposal:
+        tools.append({"type": "function", "function": {"name": "propose_followup",
+            "description": "Propose a follow-up reply and optional validated internal plan change",
+            "parameters": schema.model_json_schema()}})
+        proposal_names.add("propose_followup")
+    failures = 0
     try:
         async with asyncio.timeout(120):
-            for attempt in range(2):
+            for round_index in range(4):
                 reserve_call(run_id, estimated_tokens(json.dumps(messages, ensure_ascii=False) + json.dumps(tools, ensure_ascii=False)))
                 result = await adapter.complete(messages, tools, max_tokens=2048,
-                    tool_choice={"type": "function", "function": {"name": name}})
+                    tool_choice={"type": "function", "function": {"name": name}}
+                    if schema is InitialPlan or round_index == 3 else "auto")
                 usage = result.get("usage") or {}
                 with SessionLocal.begin() as db:
                     run = db.get(Run, run_id)
                     run.metrics = {**run.metrics, "model_id": result["model"], "usage": usage}
                 try:
                     calls = result.get("tool_calls") or []
-                    if len(calls) != 1 or calls[0].get("function", {}).get("name") != name:
-                        raise ValueError("Required single proposal function was not returned")
+                    if len(calls) != 1 or not isinstance(calls[0], dict):
+                        raise ValueError("Return exactly one supported function per round")
+                    call = calls[0]
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        raise ValueError("Malformed function call")
+                    tool_name = function.get("name")
+                    if tool_name in READ_TOOLS:
+                        if not isinstance(call.get("id"), str) or not call["id"] or len(call["id"]) > 200:
+                            raise ValueError("Read call requires a bounded tool call ID")
+                        encoded = function.get("arguments", "{}")
+                        if not isinstance(encoded, str) or len(encoded) > 2000:
+                            raise ValueError("Snapshot tool arguments exceeded bounds")
+                        output = read_snapshot(context, tool_name, json.loads(encoded))
+                        messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                        messages.append({"role": "tool", "tool_call_id": call["id"],
+                            "content": json.dumps(output, ensure_ascii=False, default=str)})
+                        continue
+                    if tool_name not in proposal_names:
+                        raise ValueError("Return the required proposal or a supported snapshot read")
                     proposal = schema.model_validate_json(calls[0]["function"]["arguments"])
                     if schema is InitialPlan:
                         validate_dependencies(proposal.tasks)
@@ -174,10 +237,12 @@ async def generate(run_id, context, schema, purpose, validator=None):
                         validator(proposal)
                     return proposal
                 except (ValueError, ValidationError, KeyError, TypeError) as exc:
-                    if attempt:
+                    failures += 1
+                    if failures >= 2:
                         raise AdapterError("invalid_proposal", "Model returned an invalid proposal; previous plan preserved") from None
                     detail = str(exc)[:250] if type(exc) is ValueError else type(exc).__name__
                     messages.append({"role": "user", "content": "Previous output failed validation. Return a corrected proposal. " + detail})
+            raise AdapterError("tool_limit", "Agent reached its four-round tool limit; previous plan preserved")
     except TimeoutError:
         raise AdapterError("timeout", "Agent exceeded its 120-second planning limit") from None
     finally:
@@ -213,6 +278,8 @@ def apply_patch(db, goal, patch: PlanPatch, run=None, user_confirmed_ids=(), dry
             raise ValueError("Unknown or repeated task")
         seen.add(change.task_id)
         task = tasks[change.task_id]
+        if change.priority is not None and change.priority != task.priority and task.criteria.get("priority_locked_by_user"):
+            raise ValueError("Model cannot override a user-selected priority")
         if change.status and change.status != task.status and (task.criteria.get("confirmed_by_user") or task.status == "skipped"):
             raise ValueError("Model cannot override a user-confirmed completion or skipped scope")
         passed, _, checked_evidence = criterion_result(task, records)

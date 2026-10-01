@@ -8,7 +8,7 @@ updated: 2026-09-30
 
 # Qianyan — Technical Spec
 
-依据新版 Scope 和 PRD。本文件定义可实施的推荐架构；尚未开始编码、配置账户或部署。技术选型与默认值待用户统一确认。旧 DecisionPatch 文档已移到 archive，不用于当前实现。
+依据已批准的 Scope 和 PRD。本文件定义开发基线；本地实现已开始，真实账户与生产部署仍需验证。旧 DecisionPatch 文档已移到 archive，不用于当前实现。当前证据见 checklist。
 
 ## How This Works, In Plain Language
 
@@ -57,7 +57,7 @@ flowchart TD
 
 ## Stack
 
-以下是推荐，不是用户已选定的栈。目标 Python 3.12、Node.js 22（满足实际 Vite 要求的补丁版）、PostgreSQL 16；正式开发时锁定依赖版本并生成 lock 文件。本次没有安装依赖。
+已批准的栈为 Python 3.12、Node.js 24、PostgreSQL 16；依赖已通过 uv.lock 和 package-lock.json 锁定。本地使用 PostgreSQL 16，生产仍按下述容器部署基线执行。
 
 | 层 | 推荐 | 选择理由与文档 |
 |---|---|---|
@@ -133,6 +133,8 @@ API 负责认证、空间隔离、输入校验、读写产品状态与排队。�
 
 建议每次最多四轮工具调用、最多两次规划生成、总运行时限 120 秒。耗时达到上限后保留事实与旧计划并报告需重试，不无限自循环。
 
+当前实现：只读工具访问本次运行已构造的、有空间边界的快照，不能选择另一空间、目标或任意 URL。每轮最多返回一个工具调用，读取与最终提议都先预留模型预算；第四轮要求最终提议。模型即使继续请求读取也会在四轮后停止。提议失败最多纠正一次，产品写入仍经过事务中的版本与业务校验。
+
 ### PlanPatch Contract and Validation
 
 候选字段：goal_id、base_plan_version、evidence_ids、changes、reason、next_action、followup_at、notification_candidate。
@@ -200,7 +202,7 @@ API 负责认证、空间隔离、输入校验、读写产品状态与排队。�
 | jobs | space_id、goal_id、kind、due_at、payload、dedup_key、lease_until、attempts、status | 持久调度、重启恢复；payload 引用记录 ID |
 | notifications | space_id、goal_id、category、reason_key、body、due_at、send_state、provider_id、action_state | 同时作为 outbox/收件箱；动作一次消费；待投递时复查是否仍有效 |
 
-键规则：外部 Evidence `(space, source, source_id, version, fact_kind)` 唯一；jobs 的有效 dedup_key 唯一；通知 reason_key 包含事件/阻塞版本。同一源重复抓取仅更新 last_seen，不形成新进度。
+键规则：records `(space_id, goal_id, kind, source, source_id, version)` 唯一，同一仓库可以独立服务不同目标；jobs 的 dedup_key 唯一；通知 reason_key 包含事件/阻塞版本。同一源重复抓取仅更新 observed_at，不形成新进度。
 
 使用事务和 plan_version 避免用户操作被后台旧计划覆盖。API/Worker 共享库，不靠内存字典长期保存状态。初版 SQLAlchemy 普通事务即可，不做事件溯源基础设施；records 保留必要事实历史。
 
@@ -208,11 +210,12 @@ API 负责认证、空间隔离、输入校验、读写产品状态与排队。�
 
 实现 F5、F8。
 
-- 独立进程每约三十秒检查 jobs。一次只领取适量任务，事务行锁配合 lease；任务处理中宕机，lease 到期可重新领取。
+- 独立进程默认每五秒检查 jobs。一次只领取适量任务，事务行锁配合 lease；任务处理中宕机，lease 到期可重新领取。
 - GitHub/Vercel 默认五分钟轮询；没有连接器时只处理内部到期跟进。源有限重试后降低频率并标 unavailable；新事实与到期行动才调用 Agent。
 - 任一 job 可被重复执行，内部效果按 dedup_key 幂等；发送通知存在网络不确定性，不能保证对外“恰好一次”。平台响应超时记录 unknown delivery，避免立刻无限重发；有限重试需复用发送标识并展示可能重复。
 - 跟进 due_at 和联系窗口取较晚可用时刻；发送前检查目标仍活动、原阻塞仍存在、用户未暂停或已处理，撤销过时通知。
 - 后台写 heartbeat；`/health/ready` 判断数据库、Worker 新鲜度与配置，网页显示最后运行时间。目标完成后停止周期任务。
+- 撤销保留 Evidence，安排三十秒后的持久 recheck；复核不要求数据源版本再次变化，不重复发送相同进展通知。用户固定的优先级不会被模型或确定性重排覆盖。
 
 ## Notification Service and WeChat Adapter
 
@@ -262,6 +265,8 @@ GET header 固定 accept，API 版本选开发时仍支持的官方版本；不�
 来源：[列表](https://vercel.com/docs/rest-api/deployments/list-deployments)、[部署详情](https://vercel.com/docs/rest-api/deployments/get-a-deployment-by-id-or-url)、[部署日志](https://vercel.com/docs/rest-api/deployments/get-deployment-events)。
 
 从 provider 已确认 alias/Production 域名推导健康检查 URL；GET 有短超时，检查网络结果与 provider 状态分别记录。保护/private 链接的 401/403 不等于部署失败。URL 探测限制已绑定合法 HTTPS 域名，拒绝私网/回环/云元数据地址与跳转到这些地址，避免任意用户 URL 变服务器请求。
+
+当前探测只请求 origin 的 `/` 并读取有界响应头：DNS 中任一地址非公网则不连接；连接固定在已验证 IP，TLS 仍校验原域名；不携带 provider 凭据，不跟随任何跳转。2xx、认证保护、未检查跳转、限流、HTTP 错误和网络未知分别记录；响应正常不等于功能验收。已确认的最新生产部署失败不会因 Build Log 权限不足变成未知，部分日志不阻止对应阻塞通知。
 
 ## Internal Product API Contracts
 

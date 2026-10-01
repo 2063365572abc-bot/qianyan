@@ -7,7 +7,7 @@ from markdown_it import MarkdownIt
 from sqlalchemy import select
 from fastapi import HTTPException
 from .db import Space, Task, Record, Notification, Run, now, uid
-from .services import serialize, update_risk
+from .services import serialize, update_risk, queue
 
 
 def fingerprint(value):
@@ -16,6 +16,7 @@ def fingerprint(value):
 
 def readme_standard(content):
     sections, current = {}, None
+    usage_example = False
     tokens = MarkdownIt().parse(content)
     for i, token in enumerate(tokens):
         if token.type == "heading_open":
@@ -31,6 +32,11 @@ def readme_standard(content):
             if i and tokens[i - 1].type == "heading_open":
                 continue
             sections[current].append(token.content.strip())
+            if current == "usage" and token.content.strip():
+                usage_example = usage_example or token.type in ("fence", "code_block") or bool(
+                    re.search(r"https?://\S+|\b(?:npm|pnpm|yarn|pip|uv|docker|python|make|cargo|go|bun)\s+\S+", token.content))
+                if token.children:
+                    usage_example = usage_example or any(t.type == "code_inline" and t.content.strip() for t in token.children)
     missing = []
     for name in ("introduction", "installation", "usage"):
         text = "\n".join(sections.get(name, []))
@@ -39,14 +45,14 @@ def readme_standard(content):
             missing.append(name)
         elif name == "installation" and not re.search(r"(?im)\b(?:npm|pnpm|yarn|pip|uv|docker|git|python|make|cargo|go|bun)\s+\S+", substantive):
             missing.append("installation commands")
-        elif name == "usage" and not (len(substantive) > 15 and re.search(r"[\w/][\w/-]*\s+\S+|https?://", substantive)):
+        elif name == "usage" and not usage_example:
             missing.append("usage example")
     return {"passed": not missing, "missing": missing, "standard": "README structure; commands not execution-verified"}
 
 
-def criterion_result(task, records):
+def criterion_result(task, records, respect_user=True):
     kind = task.criteria.get("kind", "user")
-    if kind == "user" or task.criteria.get("confirmed_by_user"):
+    if kind == "user" or respect_user and task.criteria.get("confirmed_by_user"):
         return None, "需要用户判断 / User judgment", None
     candidates = [r for r in records if r.body.get("facts", {}).get("kind") == kind and r.active]
     if kind == "deployment":
@@ -55,7 +61,8 @@ def criterion_result(task, records):
         return None, "暂无可靠证据 / No current evidence", None
     record = max(candidates, key=lambda r: r.observed_at)
     facts = record.body["facts"]
-    if record.body.get("partial") or facts.get("observed") is False:
+    state_known = kind == "deployment" and facts.get("completion_evidence_complete") is True
+    if record.body.get("stale") or record.body.get("partial") and not state_known or facts.get("observed") is False:
         return None, "证据不完整 / Incomplete observation", record
     if kind == "readme":
         if facts.get("exists") is not True:
@@ -147,25 +154,39 @@ def store_observations(db, goal, observations, data_mode="live"):
     return changed
 
 
-def evaluate_progress(db, goal, run=None):
+def evaluate_progress(db, goal, run=None, emit_notifications=True):
     before = snapshot(db, goal)
     tasks = list(db.scalars(select(Task).where(Task.goal_id == goal.id)))
     evidence = list(db.scalars(select(Record).where(Record.goal_id == goal.id, Record.kind == "evidence", Record.active.is_(True))))
     space = db.get(Space, goal.space_id)
     decisions = []
+    checked_evidence = {}
     for task in tasks:
         if task.status == "skipped":
+            continue
+        if task.criteria.get("confirmed_by_user"):
+            passed, reason, record = criterion_result(task, evidence, respect_user=False)
+            if emit_notifications and passed is False and record and record.id not in task.criteria.get("confirmed_against_evidence_ids", []):
+                notify(db, space, goal, "decision", f"confirmation-conflict:{goal.id}:{task.id}:{record.id}",
+                    {"title": "你的确认与新证据不同 / Your confirmation differs from new evidence",
+                     "text": reason, "task_id": task.id, "user_confirmation_conflict": True,
+                     "next_action": "保留你的确认，或重新检查 / Keep your confirmation or review the task",
+                     "evidence_ids": [record.id]})
             continue
         passed, reason, record = criterion_result(task, evidence)
         if passed is None:
             continue
+        if record:
+            checked_evidence[task.id] = record.id
         if passed:
             task.status = "done"
             for fix in tasks:
                 if fix.criteria.get("blocker_for") == task.id and fix.status != "skipped" and not fix.criteria.get("confirmed_by_user"):
                     fix.status = "done"
         elif task.criteria.get("kind") == "deployment":
-            task.status, task.priority = "blocked", 1
+            task.status = "blocked"
+            if not task.criteria.get("priority_locked_by_user"):
+                task.priority = 1
             fix = next((t for t in tasks if t.criteria.get("blocker_for") == task.id), None)
             if not fix and len(tasks) < 10:
                 fix = Task(id=uid(), goal_id=goal.id, title="检查 Build Log，排查部署失败 / Inspect build log and unblock deployment", priority=1,
@@ -173,11 +194,14 @@ def evaluate_progress(db, goal, run=None):
                 db.add(fix)
                 tasks.append(fix)
             elif fix and fix.status != "skipped" and not fix.criteria.get("confirmed_by_user"):
-                fix.status, fix.priority = "todo", 1
+                fix.status = "todo"
+                if not fix.criteria.get("priority_locked_by_user"):
+                    fix.priority = 1
         else:
             old = task.status
             task.status = "needs_review" if task.criteria.get("kind") == "readme" else "in_progress"
             if task.criteria.get("kind") == "readme" and old != "needs_review":
+                task.criteria = {**task.criteria, "review_episode": task.criteria.get("review_episode", 0) + 1}
                 decisions.append((task, reason, record))
     db.flush()
     update_risk(db, goal)
@@ -191,15 +215,17 @@ def evaluate_progress(db, goal, run=None):
     if changes:
         goal.plan_version += 1
         patch = {"title": "Qianyan updated your plan", "changes": changes, "next_action": goal.next_action,
-                 "risk": goal.risk, "evidence_ids": [r.id for r in evidence], "reason": "已核对当前事实和完成标准 / Current facts checked against completion standards"}
+                 "risk": goal.risk, "evidence_ids": sorted({checked_evidence.get(c["task_id"]) or
+                     checked_evidence.get(c["after"]["criteria"].get("blocker_for")) for c in changes} - {None}),
+                 "reason": "已核对当前事实和完成标准 / Current facts checked against completion standards"}
         if run:
             run.patch = patch
             run.metrics = {**run.metrics, "before": before, "after": after, "committed_version": goal.plan_version, "data_mode": "replay" if space.role == "demo" else "live"}
         failed = any(t.status == "blocked" for t in tasks)
-        if failed or any(c["after"]["status"] == "done" for c in changes):
+        if emit_notifications and (failed or any(c["after"]["status"] == "done" for c in changes)):
             notify(db, space, goal, "important_change", f"progress:{goal.id}:{fingerprint(changes)}", patch)
-    for task, reason, record in decisions:
-        notify(db, space, goal, "decision", f"review:{goal.id}:{task.id}:{fingerprint(reason)}",
+    for task, reason, record in decisions if emit_notifications else []:
+        notify(db, space, goal, "decision", f"review:{goal.id}:{task.id}:{task.criteria.get('review_episode', 0)}:{fingerprint(reason)}",
                {"title": "需要你判断 / Your decision needed", "text": reason, "task_id": task.id,
                 "next_action": "补齐完成条件，或明确确认 / Fill missing requirements or confirm explicitly", "evidence_ids": [record.id] if record else []})
     return changes
@@ -213,14 +239,23 @@ def undo_latest(db, goal):
     old_tasks = {t["id"]: t for t in run.metrics["before"]["tasks"]}
     for task in db.scalars(select(Task).where(Task.goal_id == goal.id)):
         if task.id not in old_tasks:
+            for record in db.scalars(select(Record).where(Record.task_id == task.id)):
+                record.task_id = None
+            db.flush()
             db.delete(task)
         else:
             before = old_tasks[task.id]
-            for field in ("status", "priority", "depends_on", "criteria", "title"):
+            for field in ("status", "priority", "depends_on", "criteria", "title", "estimate_hours", "followup_at"):
+                if field == "followup_at" and before.get(field):
+                    before[field] = datetime.fromisoformat(before[field])
                 setattr(task, field, before[field])
     goal.plan_version += 1
     run.metrics = {**run.metrics, "undone": True}
     update_risk(db, goal)
-    # Evidence remains available; a future observation re-evaluates conditions.
+    # Recheck even if the provider returns exactly the same evidence next time.
+    # Keep undo visible briefly, then reconcile facts without repeating a push.
+    if goal.status == "active":
+        queue(db, goal.space_id, "recheck", {}, goal.id, now() + timedelta(seconds=30),
+              f"recheck:{goal.id}:{goal.plan_version}")
     for note in db.scalars(select(Notification).where(Notification.goal_id == goal.id, Notification.send_state == "pending")):
         note.send_state = "cancelled"

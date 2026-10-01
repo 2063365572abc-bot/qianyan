@@ -78,6 +78,35 @@ def test_model_cannot_mark_subjective_acceptance_done_without_user_confirmation(
     assert not db.added
 
 
+def test_readme_prose_without_usage_example_does_not_complete():
+    content = "## Introduction\nA personal butler.\n## Installation\n`npm install`\n## Usage\nUsage information will be added later."
+    result = planning.readme_standard(content)
+    assert not result["passed"] and "usage example" in result["missing"]
+    assert planning.readme_standard(content.replace("Usage information will be added later.", "Run `npm run dev`."))["passed"]
+
+
+def test_confirmed_deployment_failure_remains_known_when_build_logs_unavailable():
+    item = task(criteria={"kind": "deployment"})
+    record = evidence({"kind": "deployment", "role": "latest", "state": "ERROR",
+                       "completion_evidence_complete": True, "build_log_status": "permission"}, partial=True, source="vercel")
+    passed, reason, cited = planning.criterion_result(item, [record])
+    assert passed is False and cited is record
+    record.body = {**record.body, "stale": True}
+    assert planning.criterion_result(item, [record])[0] is None
+
+
+def test_snapshot_reads_cannot_select_another_space_goal_or_record():
+    context = {"memories": [{"id": "current-memory", "content": "Owned fact"}],
+               "goal": {"id": "current-goal", "tasks": [{"id": "owned-task"}], "evidence": [{"id": "owned-evidence"}]}}
+    assert agent.read_snapshot(context, "list_tasks", {}) == [{"id": "owned-task"}]
+    assert agent.read_snapshot(context, "read_evidence", {"ids": ["owned-evidence"]}) == [{"id": "owned-evidence"}]
+    for name, arguments in (("read_memory", {"ids": ["foreign-memory"]}), ("get_goal", {"space_id": "other"}),
+                            ("read_evidence", {"url": "https://attacker.example"}), ("read_memory", {"ids": "current-memory"}),
+                            ("shell", {})):
+        with pytest.raises(ValueError):
+            agent.read_snapshot(context, name, arguments)
+
+
 def test_model_cannot_use_commit_success_as_subjective_mvp_acceptance():
     item = task(criteria={"kind": "user"})
     record = evidence({"kind": "commit", "sha": "abc123", "exists": True})

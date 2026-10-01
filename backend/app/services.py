@@ -30,6 +30,19 @@ def default_settings():
     return ButlerSettings().model_dump()
 
 
+def confirm_task(db, space_id, goal, task, summary):
+    for previous in db.scalars(select(Record).where(Record.task_id == task.id, Record.kind == "evidence",
+                                                   Record.source == "user", Record.active.is_(True))):
+        previous.active = False
+    matching = [r.id for r in db.scalars(select(Record).where(Record.goal_id == goal.id,
+        Record.kind == "evidence", Record.active.is_(True)))
+        if r.body.get("facts", {}).get("kind") == task.criteria.get("kind")]
+    task.status = "done"
+    task.criteria = {**task.criteria, "confirmed_by_user": True, "confirmed_against_evidence_ids": matching}
+    return add_record(db, space_id, "evidence", {"kind": "user_confirmation", "summary": summary,
+        "confidence": "high", "accepted_observation_ids": matching}, goal.id, task_id=task.id)
+
+
 def add_record(db, space_id, kind, body, goal_id=None, source="user", source_id=None, version="1", task_id=None):
     row = Record(id=uid(), space_id=space_id, kind=kind, body=body, goal_id=goal_id,
                  source=source, source_id=source_id or uid(), version=str(version), task_id=task_id)
@@ -59,6 +72,30 @@ def new_run(db, space_id, trigger, goal_id=None):
     db.add(run)
     db.flush()
     return run
+
+
+def invalidate_memory(db, space_id, memory):
+    """Erase source and derived text while retaining budget and authoritative goals."""
+    records = list(db.scalars(select(Record).where(Record.space_id == space_id)))
+    lineage = {r.id for r in records if r.kind == "memory" and r.source_id == memory.source_id}
+    lineage.add(memory.id)
+    origins = {r.origin_record_id for r in records if r.id in lineage and r.origin_record_id}
+    for record in records:
+        if (record.id in lineage or record.id in origins or record.origin_record_id in lineage
+                or record.kind == "summary" or lineage.intersection(record.body.get("context_memory_ids", []))):
+            record.active, record.body = False, {}
+    for run in db.scalars(select(Run).where(Run.space_id == space_id)):
+        if lineage.intersection(run.metrics.get("context_memory_ids", [])):
+            run.patch, run.error = {}, None
+            run.metrics = {k: v for k, v in run.metrics.items() if k in (
+                "model_calls", "reserved_tokens", "budget_day", "daily_calls", "daily_reserved_tokens", "model_id", "usage")}
+            run.metrics = {**run.metrics, "explanation_forgotten": True}
+    for note in db.scalars(select(Notification).where(Notification.space_id == space_id)):
+        if lineage.intersection(note.body.get("context_memory_ids", [])):
+            note.body = {"text": "相关记忆已遗忘 / Related memory was forgotten"}
+            note.action_state = "handled"
+            if note.send_state in ("pending", "in_app"):
+                note.send_state = "cancelled"
 
 
 def goal_detail(db, goal):

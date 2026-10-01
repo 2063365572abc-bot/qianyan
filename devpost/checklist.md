@@ -78,12 +78,14 @@ Build mode: fast — 用户明确批准整套方案并委托完成实现、测�
 
 证据：
 
-- `cd backend; uv run pytest -q`：62项通过，包括真实PostgreSQL空间隔离、CSRF/版本、遗忘并发、暂停后已领取任务取消、模型函数调用MockTransport、对话捕获目标草稿及预算防重置。
+- `cd backend; uv run pytest -q`：98项通过，包括真实PostgreSQL空间隔离、CSRF/版本、遗忘并发与派生回复清除、任务完整编辑/依赖/草稿删除、用户优先级保护、用户确认与新证据冲突、撤销后的持久复核、普通commit不触发推理、四轮只读工具与逐次预算、部署日志权限不足时的阻塞通知、HTTPS探测的固定IP/TLS/私网拒绝边界。模型和外部平台使用MockTransport或显式fake，不计真实接入验收。
 - `cd frontend; npm run build`：通过。
-- `cd frontend; npm run verify:integration`：真实HTTP/API/Worker五组闭环通过，含四种回放、设置/记忆、目标状态、导出、双cookie隔离。
+- `cd frontend; npm run verify:integration`：API与Worker重启后，真实HTTP/API/Worker五组闭环通过，含四种回放、设置/记忆、目标状态、导出、双cookie隔离；ready确认数据库与Worker在线。
 - 真实`pg_dump`→独立恢复库：九张表的行数、结构、约束与Alembic版本一致；原库只读，未覆盖数据库。详见`infra/backup-notes.md`。
 - 本地网页入口曾做桌面/手机布局检查；本轮浏览器连接不可用，完整可视交互验收仍待继续。HTTP验收不冒充浏览器验收。
 
 尚未通过的门槛：真实Nemotron账户推理及自然对话联调、真实GitHub/Vercel账户观察、企业微信手机双向收发、生产容器运行、公网部署、真实跨日记录、公开仓库/视频及用户体验反馈。因此四个slice与最终验收仍未勾选，项目目标保持active。
 
 代码地图已保存`devpost/app-map.html`，是参考路线；用户尚未实际参与代码导览，未标学习活动完成。
+
+下一轮实现审计：相对日期的绝对日期/时区确认流程；撤销对模型调整的跟进时间恢复；免打扰窗口内积压跟进的发送节流。随后完成真实账户联调、生产部署与公开Demo/视频材料，保持既有P0范围。

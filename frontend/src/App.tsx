@@ -37,6 +37,7 @@ import type {
   Notification,
   Settings,
   State,
+  Task,
 } from "./types";
 
 type Page = "today" | "memory" | "inbox" | "settings" | "demo";
@@ -72,6 +73,10 @@ function words(body: unknown): string {
     .map(([key, value]) => `${key.replaceAll("_", " ")}: ${words(value)}`)
     .join("\n");
 }
+function confirmationConflict(body: unknown): boolean {
+  return typeof body === "object" && body !== null &&
+    "user_confirmation_conflict" in body && body.user_confirmation_conflict === true;
+}
 export default function App() {
   const [lang, setLang] = useState<"zh" | "en">(() =>
     localStorage.getItem("qianyan-language") === "en" ? "en" : "zh",
@@ -99,6 +104,7 @@ export default function App() {
   const [evidence, setEvidence] = useState<Evidence | null>(null);
   const [sourceGoal, setSourceGoal] = useState<Goal | null>(null);
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
+  const [editingTask, setEditingTask] = useState<{ goal: Goal; task: Task } | null>(null);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [memoryEdit, setMemoryEdit] = useState<Memory | null>(null);
   const [memoryAdding, setMemoryAdding] = useState(false);
@@ -935,6 +941,9 @@ export default function App() {
                                     <span>
                                       {t("优先级", "Priority")} {task.priority}
                                     </span>
+                                    {!!(task.criteria as Record<string, unknown>)?.priority_locked_by_user && (
+                                      <span>{t("由你固定", "Set by you")}</span>
+                                    )}
                                     {task.estimate_hours != null && (
                                       <span>{task.estimate_hours}h</span>
                                     )}
@@ -980,7 +989,7 @@ export default function App() {
                                             "修改任务状态",
                                             "Update task status",
                                           )}
-                                          disabled={busy}
+                                          disabled={busy || goal.status === "done"}
                                           value={task.status}
                                           onChange={(e) =>
                                             void mutate(
@@ -1010,7 +1019,7 @@ export default function App() {
                                       <label>
                                         {t("优先级", "Priority")}
                                         <select
-                                          disabled={busy}
+                                          disabled={busy || goal.status === "done"}
                                           value={task.priority}
                                           onChange={(e) =>
                                             void mutate(
@@ -1033,6 +1042,10 @@ export default function App() {
                                         </select>
                                       </label>
                                     </div>
+                                    <button className="secondary compact" disabled={busy || goal.status === "done"}
+                                      onClick={() => setEditingTask({ goal, task })}>
+                                      <Settings2 size={14} />{t("编辑任务与依赖", "Edit task and dependencies")}
+                                    </button>
                                     <p className="fine-print">
                                       {t(
                                         "手动设为完成会记录为用户确认，不会伪造平台成功。",
@@ -1532,7 +1545,9 @@ export default function App() {
                                         )
                                       }
                                     >
-                                      {t("仍标记完成", "Mark done anyway")}
+                                      {confirmationConflict(item.body)
+                                        ? t("保留我的确认", "Keep my confirmation")
+                                        : t("仍标记完成", "Mark done anyway")}
                                     </button>
                                     <button
                                       className="text-button"
@@ -1544,7 +1559,9 @@ export default function App() {
                                         )
                                       }
                                     >
-                                      {t("保持进行中", "Keep open")}
+                                      {confirmationConflict(item.body)
+                                        ? t("重新检查任务", "Review task")
+                                        : t("保持进行中", "Keep open")}
                                     </button>
                                   </>
                                 )}
@@ -2178,6 +2195,74 @@ export default function App() {
               <Plus size={16} />
               {t("添加任务", "Add task")}
             </button>
+          </form>
+        </Modal>
+      )}
+      {editingTask && (
+        <Modal error={error} title={t("编辑任务", "Edit task")} onClose={() => setEditingTask(null)}>
+          <form onSubmit={async (e) => {
+            e.preventDefault();
+            const form = new FormData(e.currentTarget);
+            const description = String(form.get("description") || "").trim();
+            if (await mutate(`/tasks/${editingTask.task.id}`, "PATCH", {
+              version: editingTask.goal.plan_version,
+              title: form.get("title"),
+              criteria: { kind: form.get("kind"), ...(description ? { description } : {}) },
+              estimate_hours: Number(form.get("estimate")),
+              priority: Number(form.get("priority")),
+              priority_mode: form.get("priority_mode"),
+              depends_on: form.getAll("depends_on"),
+            })) setEditingTask(null);
+          }}>
+            <label>{t("任务名称", "Task title")}
+              <input name="title" defaultValue={editingTask.task.title} required maxLength={300} />
+            </label>
+            <label>{t("完成判断方式", "Completion rule")}
+              <select name="kind" defaultValue={String((editingTask.task.criteria as Record<string, unknown>)?.kind || "user")}>
+                {[
+                  ["user", t("由我确认", "My confirmation")],
+                  ["readme", t("README 结构符合标准", "README structure")],
+                  ["ci", t("当前提交的指定 CI 通过", "Current-commit CI success")],
+                  ["deployment", t("生产构建成功与 URL 已确认", "Production build and URL")],
+                  ["repo", t("绑定仓库存在", "Bound repository exists")],
+                  ["core_dir", t("指定核心目录存在", "Core directory exists")],
+                ].map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
+            <label>{t("完成要求补充说明", "Additional completion notes")}
+              <textarea name="description" rows={3} maxLength={1500}
+                defaultValue={String((editingTask.task.criteria as Record<string, unknown>)?.description || "")} />
+            </label>
+            <p className="fine-print">{t("补充说明不会改变自动核验规则。需要主观验收时请选择「由我确认」。修改已完成任务的标准后会重新等待判断。", "Notes do not change automatic checks. Choose My confirmation for subjective acceptance. Changing a completed task's rule requires review.")}</p>
+            <div className="form-pair">
+              <label>{t("优先级", "Priority")}
+                <select name="priority" defaultValue={editingTask.task.priority}>
+                  {[1, 2, 3, 4, 5].map(value => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </label>
+              <label>{t("预估小时", "Estimated hours")}
+                <input name="estimate" type="number" min="0.25" max="100" step="0.25" required defaultValue={editingTask.task.estimate_hours || 1} />
+              </label>
+            </div>
+            <label>{t("优先级由谁维护", "Who maintains priority")}
+              <select name="priority_mode" defaultValue={(editingTask.task.criteria as Record<string, unknown>)?.priority_locked_by_user ? "manual" : "auto"}>
+                <option value="auto">{t("管家根据进度调整", "Butler adjusts with progress")}</option>
+                <option value="manual">{t("固定我的选择", "Keep my choice")}</option>
+              </select>
+            </label>
+            <fieldset className="dependency-options">
+              <legend>{t("依赖任务", "Dependencies")}</legend>
+              {editingTask.goal.tasks.filter(item => item.id !== editingTask.task.id).map(item => (
+                <label key={item.id}><input type="checkbox" name="depends_on" value={item.id}
+                  defaultChecked={editingTask.task.depends_on.includes(item.id)} />{item.title}</label>
+              ))}
+            </fieldset>
+            <button className="primary wide" disabled={busy}>{t("保存任务", "Save task")}</button>
+            {editingTask.goal.status === "draft" && (
+              <button type="button" className="secondary wide" disabled={busy} onClick={async () => {
+                if (await mutate(`/tasks/${editingTask.task.id}?version=${editingTask.goal.plan_version}`, "DELETE")) setEditingTask(null);
+              }}><Trash2 size={15} />{t("删除草稿任务", "Delete draft task")}</button>
+            )}
           </form>
         </Modal>
       )}

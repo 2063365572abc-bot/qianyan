@@ -15,6 +15,7 @@ from .planning import (store_observations, evaluate_progress, next_contact, noti
                        fingerprint, snapshot)
 from .agent import build_context, context_revision, generate, apply_patch, ResponseProposal
 from .schemas import InitialPlan
+from .services import confirm_task
 from .adapters import GitHubAdapter, VercelAdapter, WeComAdapter, Observation, AdapterError
 
 log = logging.getLogger("qianyan.worker")
@@ -109,6 +110,7 @@ async def initial_plan(job_id, token):
         install_initial_plan(db, goal, plan, base)
         run.patch = {"title": "初始计划待确认 / Review initial plan", "reason": plan.reason, "next_action": goal.next_action}
         run.status = "succeeded"
+        run.metrics = {**run.metrics, "context_memory_ids": ctx.get("memory_dependencies", [])}
         add_record(db, space.id, "message", {"role": "assistant", "text": "已生成初始计划，请检查完成标准和截止时间后确认。 / Your draft plan is ready for review."}, goal.id, "agent")
 
 
@@ -176,7 +178,7 @@ async def observe(job_id, token, replay=False):
         if not replay and goal.source_bindings:
             due = now() + timedelta(seconds=config().observation_interval)
             queue(db, space.id, "observe", {}, goal.id, due, f"observe:{goal.id}:{job.id}")
-    if changed and config().nebius_api_key:
+    if changes and config().nebius_api_key:
         await model_followup(job_id, token, ctx, rev, run_id,
             "Review the newly observed facts and current checked plan. Propose justified priority/dependency/next-action/follow-up changes only if useful. Explain uncertainties.")
 
@@ -232,7 +234,9 @@ async def model_followup(job_id, token, ctx, rev, run_id, purpose):
                 run.patch = {"title": "目标草稿已保存 / Goal draft saved", "goal_id": goal.id,
                     "reason": "初始计划生成后仍需你确认 / Review and confirm the initial plan"}
             add_record(db, space.id, "message", {"role": "assistant", "text": response.reply,
-                "type": "proposal_explanation", "run_id": run.id}, goal.id if goal else None, "agent")
+                "type": "proposal_explanation", "run_id": run.id,
+                "context_memory_ids": ctx.get("memory_dependencies", [])}, goal.id if goal else None, "agent")
+            run.metrics = {**run.metrics, "context_memory_ids": ctx.get("memory_dependencies", [])}
             run.status = "succeeded"
     except (AdapterError, ValueError) as exc:
         with SessionLocal.begin() as db:
@@ -273,9 +277,8 @@ def explicit_command(db, space, goal, record):
         if len(matches) != 1:
             return "请使用任务的完整名称或在任务页确认，避免标错任务。 / Use the exact task title or confirm in Tasks."
         task = matches[0]
-        task.status, task.criteria = "done", {**task.criteria, "confirmed_by_user": True}
+        confirm_task(db, space.id, goal, task, "用户明确确认完成 / Explicit user confirmation")
         goal.plan_version += 1
-        add_record(db, space.id, "evidence", {"kind": "user_confirmation", "summary": "用户明确确认完成 / Explicit user confirmation", "confidence": "high"}, goal.id, "user", task_id=task.id)
         update_risk(db, goal)
         return "已按你的明确确认更新任务完成状态。 / Task marked done from your explicit confirmation."
     return None
@@ -315,6 +318,18 @@ async def message(job_id, token):
         if record.source == "wecom" and goal:
             text = "你的回复已处理，请查看当前计划。 / Your reply was processed; review the current plan." if run.status == "succeeded" else run.error
             notify(db, space, goal, "decision", "reply:" + record.id, {"text": text, "next_action": goal.next_action})
+
+
+async def recheck(job_id, token):
+    """Reconcile retained evidence after undo; no network or duplicate push."""
+    with SessionLocal.begin() as db:
+        job, space, goal, run = load_claim(db, job_id, token)
+        live_goal(goal)
+        run = start_run(db, job, space, goal, run)
+        evaluate_progress(db, goal, run, emit_notifications=False)
+        run.status = "succeeded"
+        run.patch = run.patch or {"title": "保留的事实已重新核对 / Retained facts rechecked",
+                                  "changes": [], "next_action": goal.next_action, "risk": goal.risk}
 
 
 async def followup(job_id, token):
@@ -366,9 +381,17 @@ async def send_one_notification():
             return True
         if note.category == "decision" and note.body.get("task_id"):
             task = db.get(Task, note.body["task_id"])
-            if not task or task.status == "done":
+            conflict = note.body.get("user_confirmation_conflict")
+            if not task or task.status == "done" and not conflict or task.status == "skipped":
                 note.send_state = "cancelled"
                 return True
+            if conflict:
+                from .planning import criterion_result
+                evidence = list(db.scalars(select(Record).where(Record.goal_id == goal.id, Record.kind == "evidence", Record.active.is_(True))))
+                passed, _, record = criterion_result(task, evidence, respect_user=False)
+                if not task.criteria.get("confirmed_by_user") or passed is not False or not record or record.id not in note.body.get("evidence_ids", []):
+                    note.send_state = "cancelled"
+                    return True
         if note.category == "important_change":
             for change in note.body.get("changes", []):
                 task = db.get(Task, change.get("task_id"))
@@ -377,7 +400,9 @@ async def send_one_notification():
                     return True
             for evidence_id in note.body.get("evidence_ids", []):
                 record = db.get(Record, evidence_id)
-                if not record or not record.active or record.body.get("partial") or record.body.get("stale"):
+                facts = record.body.get("facts", {}) if record else {}
+                state_known = facts.get("kind") == "deployment" and facts.get("completion_evidence_complete") is True
+                if not record or not record.active or record.body.get("partial") and not state_known or record.body.get("stale"):
                     note.send_state = "cancelled"
                     return True
         if note.category == "action" and note.body.get("next_action") != goal.next_action:
@@ -453,6 +478,8 @@ async def process_claim(job_id, token):
                 await observe(job_id, token, replay=kind == "replay")
             elif kind == "followup":
                 await followup(job_id, token)
+            elif kind == "recheck":
+                await recheck(job_id, token)
             else:
                 raise AdapterError("input", "Unknown job type")
         with SessionLocal.begin() as db:

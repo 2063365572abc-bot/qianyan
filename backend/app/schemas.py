@@ -73,8 +73,24 @@ class GoalChange(StrictModel):
 
 class TaskChange(StrictModel):
     version: int
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    criteria: dict | None = None
+    estimate_hours: float | None = Field(default=None, gt=0, le=100)
+    depends_on: list[str] | None = Field(default=None, max_length=10)
     status: Literal["todo", "in_progress", "blocked", "needs_review", "done", "skipped"] | None = None
     priority: int | None = Field(default=None, ge=1, le=5)
+    priority_mode: Literal["auto", "manual"] | None = None
+
+    @field_validator("criteria")
+    @classmethod
+    def completion_rule(cls, value):
+        if value is None:
+            return value
+        if set(value) - {"kind", "description"} or value.get("kind") not in ("user", "readme", "ci", "deployment", "repo", "core_dir"):
+            raise ValueError("Unsupported completion criteria")
+        if "description" in value and (not isinstance(value["description"], str) or len(value["description"]) > 1500):
+            raise ValueError("Completion description is too long")
+        return value
 
 
 class MessageInput(StrictModel):

@@ -15,6 +15,7 @@ from .schemas import (SettingsChange, GoalInput, VersionInput, GoalChange, TaskC
                       MessageInput, MemoryInput, MemoryChange, NotificationAction, SourceChange)
 from .services import (serialize, owned_goal, check_version, default_settings, add_record,
                        queue, new_run, goal_detail, seed_demo, update_risk)
+from .services import validate_dependencies, invalidate_memory, confirm_task
 
 
 @asynccontextmanager
@@ -264,17 +265,69 @@ def edit_task(task_id: str, body: TaskChange, request: Request, db: Session = De
         raise HTTPException(404, "任务不存在 / Task not found")
     goal = owned_goal(db, space.id, task.goal_id, True)
     check_version(goal, body.version)
+    if goal.status == "done":
+        raise HTTPException(409, "目标已结束 / Goal is completed")
+    if body.depends_on is not None:
+        tasks = list(db.scalars(select(Task).where(Task.goal_id == goal.id)))
+        class Node:
+            def __init__(self, key, dependencies):
+                self.key, self.depends_on = key, dependencies
+        try:
+            validate_dependencies([Node(t.id, body.depends_on if t.id == task.id else t.depends_on) for t in tasks])
+        except ValueError:
+            raise HTTPException(422, "依赖必须属于同一目标且不能成环 / Dependencies must be local and acyclic") from None
+        task.depends_on = body.depends_on
+    if body.title is not None:
+        task.title = body.title
+    if body.estimate_hours is not None:
+        task.estimate_hours = body.estimate_hours
+    current_rule = {k: v for k, v in task.criteria.items() if k in ("kind", "description") and v != ""}
+    proposed_rule = {k: v for k, v in (body.criteria or {}).items() if v != ""}
+    if body.criteria is not None and current_rule != proposed_rule:
+        metadata = {k: v for k, v in task.criteria.items() if k in ("priority_locked_by_user", "blocker_for")}
+        task.criteria = {**proposed_rule, **metadata}
+        if task.status == "done" and body.status != "done":
+            task.status = "needs_review"
     if body.status:
         task.status = body.status
         if body.status == "done":
-            task.criteria = {**task.criteria, "confirmed_by_user": True}
-            add_record(db, space.id, "evidence", {"kind": "user_confirmation", "summary": "用户确认完成 / User confirmed completion", "confidence": "high"}, goal.id, task_id=task.id)
+            confirm_task(db, space.id, goal, task, "用户确认完成 / User confirmed completion")
         elif task.criteria.get("confirmed_by_user"):
-            task.criteria = {k: v for k, v in task.criteria.items() if k != "confirmed_by_user"}
+            task.criteria = {k: v for k, v in task.criteria.items() if k not in ("confirmed_by_user", "confirmed_against_evidence_ids")}
     if body.priority is not None:
         task.priority = body.priority
+        task.criteria = {**task.criteria, "priority_locked_by_user": body.priority_mode != "auto"}
+    elif body.priority_mode is not None:
+        task.criteria = {**task.criteria, "priority_locked_by_user": body.priority_mode == "manual"}
+    if body.status != "done" and (body.status is not None or body.criteria is not None and current_rule != proposed_rule):
+        for evidence in db.scalars(select(Record).where(Record.task_id == task.id, Record.kind == "evidence", Record.source == "user")):
+            evidence.active = False
     goal.plan_version += 1
     add_record(db, space.id, "decision", {"action": "edit_task", "task_id": task.id, "changes": body.model_dump(exclude={"version"}, exclude_none=True)}, goal.id)
+    update_risk(db, goal)
+    db.commit()
+    return goal_detail(db, goal)
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_draft_task(task_id: str, version: int, request: Request, db: Session = Depends(session)):
+    space = context(request, db)
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在 / Task not found")
+    goal = owned_goal(db, space.id, task.goal_id, True)
+    check_version(goal, version)
+    if goal.status != "draft":
+        raise HTTPException(422, "仅可删除草稿任务；已确认计划请选择不再做 / Delete draft tasks only; use Skipped for confirmed plans")
+    for dependent in db.scalars(select(Task).where(Task.goal_id == goal.id)):
+        if task.id in dependent.depends_on:
+            raise HTTPException(422, "先移除其他任务对它的依赖 / Remove dependencies on this task first")
+    for record in db.scalars(select(Record).where(Record.task_id == task.id)):
+        record.task_id = None
+    db.flush()
+    db.delete(task)
+    goal.plan_version += 1
+    add_record(db, space.id, "decision", {"action": "delete_draft_task", "task_id": task.id}, goal.id)
     update_risk(db, goal)
     db.commit()
     return goal_detail(db, goal)
@@ -406,14 +459,7 @@ def memory_edit(record_id: str, body: MemoryChange, request: Request, db: Sessio
     row = owned_memory(db, space.id, record_id)
     if str(body.version) != row.version:
         raise HTTPException(409, "记忆已变化 / Memory changed")
-    row.active = False
-    row.body = {}
-    if row.origin_record_id:
-        origin = db.get(Record, row.origin_record_id)
-        if origin and origin.space_id == space.id:
-            origin.active, origin.body = False, {}
-    for summary in db.scalars(select(Record).where(Record.space_id == space.id, Record.kind == "summary")):
-        summary.active, summary.body = False, {}
+    invalidate_memory(db, space.id, row)
     replacement = add_record(db, space.id, "memory", {"content": body.content}, row.goal_id,
                              source="user", source_id=row.source_id, version=str(int(row.version) + 1))
     db.commit()
@@ -426,10 +472,7 @@ def memory_forget(record_id: str, request: Request, version: str, db: Session = 
     row = owned_memory(db, space.id, record_id)
     if version != row.version:
         raise HTTPException(409, "记忆已变化 / Memory changed")
-    for record in db.scalars(select(Record).where(Record.space_id == space.id)):
-        if (record.id == row.id or record.origin_record_id == row.id or record.id == row.origin_record_id
-                or record.kind == "summary" or (record.kind == "memory" and record.source_id == row.source_id)):
-            record.active, record.body = False, {}
+    invalidate_memory(db, space.id, row)
     db.commit()
     return {"forgotten": True}
 
@@ -469,15 +512,26 @@ def notification_action(note_id: str, body: NotificationAction, request: Request
         if not goal or not task or task.goal_id != goal.id:
             raise HTTPException(422, "通知没有明确任务，请在目标中确认 / No unambiguous task")
         check_version(goal, body.version)
-        task.status = "done"
-        task.criteria = {**task.criteria, "confirmed_by_user": True}
+        confirm_task(db, space.id, goal, task, "用户选择仍标记完成 / User override")
         goal.plan_version += 1
-        add_record(db, space.id, "evidence", {"kind": "user_confirmation", "summary": "用户选择仍标记完成 / User override", "confidence": "high"}, goal.id, task_id=task.id)
         update_risk(db, goal)
     elif body.action == "handled":
         add_record(db, space.id, "decision", {"action": "handled", "notification_id": note.id, "does_not_prove_external_success": True}, note.goal_id)
         if goal and space.role == "owner" and goal.source_bindings:
             queue(db, space.id, "observe", {}, goal.id)
+    elif body.action == "keep_open" and note.body.get("user_confirmation_conflict"):
+        task = db.get(Task, note.body.get("task_id"))
+        if not goal or not task or task.goal_id != goal.id:
+            raise HTTPException(422, "通知没有明确任务 / No unambiguous task")
+        check_version(goal, body.version)
+        task.status = "needs_review"
+        task.criteria = {k: v for k, v in task.criteria.items() if k not in ("confirmed_by_user", "confirmed_against_evidence_ids")}
+        for previous in db.scalars(select(Record).where(Record.task_id == task.id, Record.kind == "evidence",
+                                                       Record.source == "user", Record.active.is_(True))):
+            previous.active = False
+        goal.plan_version += 1
+        add_record(db, space.id, "decision", {"action": "review_user_confirmation", "task_id": task.id}, goal.id)
+        update_risk(db, goal)
     note.action_state = body.action
     if note.send_state == "pending":
         note.send_state = "cancelled"
