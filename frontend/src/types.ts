@@ -76,7 +76,7 @@ export type State = {
   };
   goals: Goal[];
   memories: Memory[];
-  messages: { id: string; body: unknown; source: string; created_at: string }[];
+  messages: { id: string; goal_id: string | null; body: unknown; source: string; created_at: string }[];
   notifications: Notification[];
   runs: Run[];
   health: Record<string, unknown>;

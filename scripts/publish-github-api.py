@@ -72,7 +72,7 @@ async def publish(repo, branch):
     history = [(sha, local_commit(sha), entries(sha)) for sha in revisions]
     blobs = {item["sha"] for _, _, rows in history for item in rows}
     content = {sha: git("cat-file", "blob", sha) for sha in blobs}
-    secrets = [cfg.session_secret, cfg.owner_password_hash, cfg.github_token, cfg.nebius_api_key,
+    secrets = [cfg.session_secret, cfg.owner_password_hash, cfg.github_token, cfg.nebius_api_key, cfg.aliyun_api_key,
                cfg.vercel_token, cfg.wecom_app_secret, cfg.wecom_callback_token, cfg.wecom_encoding_aes_key]
     password = urlsplit(cfg.database_url).password
     if password and len(password) > 8:

@@ -20,7 +20,11 @@ def read_env(path: Path) -> dict[str, str]:
 
 def validate(values: dict[str, str], require_wecom=False) -> list[str]:
     errors = []
-    required = ["POSTGRES_PASSWORD", "SESSION_SECRET", "OWNER_PASSWORD_HASH", "APP_PUBLIC_URL", "APP_DOMAIN", "NEBIUS_API_KEY", "NEBIUS_MODEL_ID"]
+    provider = values.get("AI_PROVIDER", "nebius")
+    if provider not in ("nebius", "aliyun"):
+        errors.append("AI_PROVIDER: choose nebius or aliyun")
+    prefix = "ALIYUN" if provider == "aliyun" else "NEBIUS"
+    required = ["POSTGRES_PASSWORD", "SESSION_SECRET", "OWNER_PASSWORD_HASH", "APP_PUBLIC_URL", "APP_DOMAIN", prefix + "_API_KEY", prefix + "_MODEL_ID"]
     for key in required:
         value = values.get(key, "")
         if not value or re.search(r"replace|placeholder|change.?me|your[_ -]", value, re.I):
@@ -41,7 +45,7 @@ def validate(values: dict[str, str], require_wecom=False) -> list[str]:
     parsed = urlparse(values.get("APP_PUBLIC_URL", ""))
     if parsed.scheme != "https" or parsed.hostname != domain or parsed.path not in ("", "/"):
         errors.append("APP_PUBLIC_URL: must be the HTTPS origin matching APP_DOMAIN")
-    if not values.get("NEBIUS_MODEL_ID", "").lower().startswith("nvidia/"):
+    if provider == "nebius" and not values.get("NEBIUS_MODEL_ID", "").lower().startswith("nvidia/"):
         errors.append("NEBIUS_MODEL_ID: use the account-verified NVIDIA Nemotron model ID")
     if values.get("AI_MODE", "live") != "live":
         errors.append("AI_MODE: production requires live")

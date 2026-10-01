@@ -633,9 +633,14 @@ svg {
   line-height: 1.8;
 }
 .home-grid {
+  min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(300px, 1fr);
   gap: 25px;
+}
+.plan-column,
+.conversation-column {
+  min-width: 0;
 }
 .section-row {
   display: flex;

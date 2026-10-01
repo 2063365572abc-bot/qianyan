@@ -1,10 +1,12 @@
 ---
 doc: spec
 status: approved
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 > 开发基线：用户已于 2026-09-30 明确同意整套方案并授权开始开发。正文中的规划阶段/待确认说明保留为历史背景；外部账户与接口验证仍需实测。
+
+> **当前交付阶段（2026-10-01，按用户最新指令）**：先完成平台本身的正常交互，用阿里云百炼 `qwen-plus` 联调。当前通知渠道为平台内收件箱；微信、其他外部账户和公网资源接入暂缓。下文涉及企业微信、Vercel实账户、公网展示及Nebius/Nemotron的内容保留为比赛交付阶段要求，不作为本阶段未完成平台功能的理由。阿里云联调不等于已满足Nebius/NVIDIA比赛技术要求。
 
 # Qianyan — Technical Spec
 
@@ -176,6 +178,18 @@ API 负责认证、空间隔离、输入校验、读写产品状态与排队。�
 如下一阶段需要“生成修复方案后运行检查”，再接 Nebius Token Factory Sandboxes/Contree，并设计仓库/命令 allowlist、网络限制、超时、资源限额、无用户密钥和结果 Evidence。账户端点与额度在接入前核验。[Sandbox 官方文档](https://docs.tokenfactory.nebius.com/sandboxes/overview)
 
 原初 Coding Agent 的 Plan → Code → Run → Test → Fix 不作为本次 MVP；当前用户确认的核心是个人管家目标闭环。
+
+## Current Model and Notification Configuration
+
+本阶段运行 `AI_PROVIDER=aliyun`、`ALIYUN_MODEL_ID=qwen-plus`、北京地域 OpenAI-compatible endpoint `https://dashscope.aliyuncs.com/compatible-mode/v1`，账户目录与真实工具调用已核验。配置显式选择供应商，缺失该供应商密钥时失败，不切换到另一家。
+
+`AI_TOOL_MODE=proposal` 使用已检索的有界上下文，强制模型调用计划/回复提议函数；`auto` 保留最多四轮的快照读取工具。所有结果仍通过相同 schema、版本、权限、完成证据与预算检查。初始计划只暴露所需提议函数，避免无关工具。每次请求预算按实际解码消息计算，不重复计算 JSON 转义；每次推理预留预算。
+
+`NOTIFICATION_CHANNEL=in_app` 将结果保存在平台收件箱，不调用微信接口；`wecom` 为后续已配置账户显式启用。读写任务、通知操作与真实 GitHub 观察不依赖微信。
+
+新增 POST `/api/goals/{id}/plan`：只有尚无任务的 draft 可重试生成；版本匹配，已有待处理生成 job 返回原 run，避免双击重复收费。个人空间入口可在已有目标时保存全局记忆、交代新目标；任务对话使用明确所选目标。
+
+官方接口依据：[Alibaba OpenAI compatible API](https://www.alibabacloud.com/help/en/model-studio/model-calling-in-sub-workspace)、[Function calling](https://www.alibabacloud.com/help/en/model-studio/qwen-function-calling)。下节为后续比赛模型接入要求。
 
 ## Nebius Token Factory and NVIDIA Nemotron
 

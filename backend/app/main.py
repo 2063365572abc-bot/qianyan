@@ -141,9 +141,10 @@ def state(request: Request, db: Session = Depends(session)):
         "runs": [serialize(r) for r in db.scalars(select(Run).where(Run.space_id == space.id).order_by(Run.created_at.desc()).limit(30))],
         "health": {"worker_last_seen": heartbeat.lease_until.isoformat() if heartbeat and heartbeat.lease_until else None,
                    "worker_online": bool(heartbeat and heartbeat.lease_until and heartbeat.lease_until > now() - timedelta(seconds=60))},
-        "integrations": {"nebius": bool(cfg.nebius_api_key), "github": bool(cfg.github_token), "vercel": bool(cfg.vercel_token),
+        "integrations": {"ai": bool(cfg.model_api_key), "provider": cfg.ai_provider, "nebius": bool(cfg.nebius_api_key), "github": bool(cfg.github_token), "vercel": bool(cfg.vercel_token),
                          "wecom": bool(cfg.wecom_corp_id and cfg.wecom_app_secret and cfg.wecom_user_id),
-                         "model_id": cfg.nebius_model_id, "mode": "live" if cfg.nebius_api_key else "unconfigured"},
+                         "model_id": cfg.model_id, "mode": "live" if cfg.model_api_key else "unconfigured",
+                         "notification_channel": cfg.notification_channel},
     }
 
 
@@ -211,6 +212,22 @@ def confirm_goal(goal_id: str, body: VersionInput, request: Request, db: Session
     add_record(db, space.id, "decision", {"action": "confirm_plan", "plan_version": goal.plan_version}, goal.id)
     db.commit()
     return goal_detail(db, goal)
+
+
+@app.post("/api/goals/{goal_id}/plan")
+def retry_initial_plan(goal_id: str, body: VersionInput, request: Request, db: Session = Depends(session)):
+    space = context(request, db)
+    goal = owned_goal(db, space.id, goal_id, lock=True)
+    check_version(goal, body.plan_version or body.version)
+    if goal.status != "draft" or db.scalar(select(Task.id).where(Task.goal_id == goal.id).limit(1)):
+        raise HTTPException(409, "已有计划，请直接编辑任务 / Edit the existing plan")
+    existing = db.scalar(select(Job).where(Job.goal_id == goal.id, Job.kind == "initial_plan", Job.status.in_(["pending", "running"])))
+    if existing:
+        return {"goal_id": goal.id, "run_id": existing.payload.get("run_id")}
+    run = new_run(db, space.id, "initial_plan", goal.id)
+    queue(db, space.id, "initial_plan", {"run_id": run.id}, goal.id)
+    db.commit()
+    return {"goal_id": goal.id, "run_id": run.id}
 
 
 @app.patch("/api/goals/{goal_id}")

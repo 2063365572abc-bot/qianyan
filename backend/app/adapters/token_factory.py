@@ -1,4 +1,4 @@
-"""Nebius OpenAI-compatible inference; never substitutes simulated responses."""
+"""OpenAI-compatible inference for the explicitly configured provider."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class TokenFactoryAdapter(HTTPAdapter):
         transport: httpx.AsyncBaseTransport | None = None, timeout: float = 60.0,
     ):
         if not api_key or not model_id:
-            raise AdapterError("configuration", "Token Factory API key and model ID are required.")
+            raise AdapterError("configuration", "Model API key and model ID are required.")
         super().__init__(base_url, client=client, transport=transport, timeout=timeout)
         self._api_key = api_key
         self.model_id = model_id
@@ -29,7 +29,7 @@ class TokenFactoryAdapter(HTTPAdapter):
     async def list_models(self) -> list[str]:
         data, _ = await self.request_json("GET", "/models", headers=self._headers)
         if not isinstance(data, dict) or not isinstance(data.get("data"), list):
-            raise AdapterError("invalid_response", "Token Factory returned an invalid model list.")
+            raise AdapterError("invalid_response", "Provider returned an invalid model list.")
         return [row["id"] for row in data["data"] if isinstance(row, dict) and isinstance(row.get("id"), str)]
 
     async def verify_model(self, *, require_nvidia: bool = True) -> str:
@@ -70,4 +70,4 @@ class TokenFactoryAdapter(HTTPAdapter):
                 "usage": data.get("usage") or {}, "model": data.get("model") or self.model_id,
             }
         except (KeyError, IndexError, TypeError):
-            raise AdapterError("invalid_response", "Token Factory returned no valid completion.") from None
+            raise AdapterError("invalid_response", "Provider returned no valid completion.") from None

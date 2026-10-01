@@ -1,5 +1,6 @@
-"""Bounded Nemotron planning. Model proposals never own product facts."""
+"""Bounded provider inference. Model proposals never own product facts."""
 import asyncio
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -57,12 +58,53 @@ be acyclic; new tasks use criteria.kind=user. If uncertain, ask one focused ques
 Use the required function to return structured output. Task IDs and evidence IDs must be
 copied exactly from context. Maintain dependencies when ordering next steps. If a goal has
 no deadline, ask for a date rather than guessing. Time is the supplied current UTC instant.
+Write clear user-facing replies: no raw database IDs, status enum values or tool names.
+Evidence IDs belong in the structured patch only. Saving a draft is not completed work.
 """
 
 
 def estimated_tokens(value):
     # Conservative mixed-language bound; actual provider usage is recorded separately.
     return sum(0.5 if ord(c) < 128 else 3 for c in value).__ceil__()
+
+
+def request_tokens(messages, tools):
+    # Providers tokenize decoded messages, not the escaped JSON transport envelope.
+    content = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls", []),
+        ensure_ascii=False, separators=(",", ":")) for m in messages)
+    return estimated_tokens(content + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) + 32 * len(messages)
+
+
+def fit_request_context(context, messages, tools, limit=7872):
+    """Reserve actual system/schema overhead before trimming optional history.
+
+    Keep authoritative state and the latest human message. Never mutate the
+    snapshot used for validation or memory erasure lineage.
+    """
+    bounded = copy.deepcopy(context)
+    rows = bounded.get("messages", [])
+    latest_user = next((row for row in reversed(rows) if row.get("role") == "user"), None)
+    while True:
+        messages[1]["content"] = json.dumps(bounded, ensure_ascii=False, default=str)
+        if request_tokens(messages, tools) <= limit:
+            return bounded
+        removable = next((i for i, row in enumerate(rows) if row is not latest_user), None)
+        if removable is not None:
+            rows.pop(removable)
+        elif bounded.get("memories"):
+            bounded["memories"].pop()
+        else:
+            raise AdapterError("context_limit", "Current goal exceeds the bounded request size; previous plan preserved.")
+        bounded["context_truncated"] = True
+
+
+def compact_schema(value, parent=None):
+    if isinstance(value, dict):
+        # Annotation names can also be real property names (GoalInput.title).
+        return {k: compact_schema(v, k) for k, v in value.items() if parent == "properties" or k not in ("title", "default")}
+    if isinstance(value, list):
+        return [compact_schema(v, parent) for v in value]
+    return value
 
 
 def build_context(db, space, goal=None):
@@ -87,8 +129,14 @@ def build_context(db, space, goal=None):
     if goal:
         detail = goal_detail(db, goal)
         detail["intent"] = detail["intent"][:1200]
+        detail.pop("space_id", None)
+        detail.pop("created_at", None)
+        detail["tasks"] = [{k: v for k, v in task.items() if k not in ("goal_id", "created_at")} for task in detail["tasks"]]
         for task in detail["tasks"]:
             task["title"] = task["title"][:120]
+            task["criteria"] = dict(task["criteria"])
+            if isinstance(task["criteria"].get("description"), str):
+                task["criteria"]["description"] = task["criteria"]["description"][:250]
         # Only summaries of external artifacts enter context, never unlimited README/logs.
         detail["evidence"] = [{"id": r["id"], "source": r["source"], "version": r["version"],
             "source_updated_at": r["source_updated_at"], "observed_at": r["observed_at"],
@@ -183,34 +231,34 @@ def read_snapshot(context, name, arguments):
 
 async def generate(run_id, context, schema, purpose, validator=None):
     cfg = config()
-    if not cfg.nebius_api_key:
-        raise AdapterError("configuration", "Nebius Token Factory 未配置；事实同步和手动计划仍可用 / Model not configured")
-    if not cfg.nebius_model_id.lower().startswith("nvidia/"):
+    if not cfg.model_api_key:
+        raise AdapterError("configuration", "AI 模型未配置；事实同步和手动计划仍可用 / Model not configured")
+    if cfg.ai_provider == "nebius" and not cfg.model_id.lower().startswith("nvidia/"):
         raise AdapterError("configuration", "An NVIDIA Nemotron model is required")
-    adapter = TokenFactoryAdapter(cfg.nebius_api_key, cfg.nebius_model_id, cfg.nebius_base_url)
-    name = "propose_plan" if schema is InitialPlan else "propose_plan_patch"
-    messages = [{"role": "system", "content": SYSTEM + "\nTask: " + purpose},
+    adapter = TokenFactoryAdapter(cfg.model_api_key, cfg.model_id, cfg.model_base_url)
+    name = "propose_plan" if schema is InitialPlan else "propose_followup"
+    response_instruction = "\nThe function arguments MUST include a top-level reply string. Put plan changes inside patch and new goals inside capture_goal; never return a naked patch or goal." if schema is ResponseProposal else ""
+    messages = [{"role": "system", "content": SYSTEM + response_instruction + "\nTask: " + purpose},
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)}]
-    tools = snapshot_tools() + [{"type": "function", "function": {"name": name, "description": "Return a bounded proposal for backend validation",
-              "parameters": schema.model_json_schema()}}]
+    tools = (snapshot_tools() if schema is ResponseProposal and cfg.ai_tool_mode == "auto" else []) + [{"type": "function", "function": {"name": name, "description": "Return a complete response including reply and optional nested patch or capture_goal" if schema is ResponseProposal else "Return a draft plan for backend validation",
+              "parameters": compact_schema(schema.model_json_schema())}}]
     proposal_names = {name}
     if schema is ResponseProposal:
-        tools.append({"type": "function", "function": {"name": "propose_followup",
-            "description": "Propose a follow-up reply and optional validated internal plan change",
-            "parameters": schema.model_json_schema()}})
-        proposal_names.add("propose_followup")
+        # Accept legacy responses without advertising the same large schema twice.
+        proposal_names.add("propose_plan_patch")
     failures = 0
     try:
         async with asyncio.timeout(120):
             for round_index in range(4):
-                reserve_call(run_id, estimated_tokens(json.dumps(messages, ensure_ascii=False) + json.dumps(tools, ensure_ascii=False)))
+                fit_request_context(context, messages, tools)
+                reserve_call(run_id, request_tokens(messages, tools))
                 result = await adapter.complete(messages, tools, max_tokens=2048,
                     tool_choice={"type": "function", "function": {"name": name}}
-                    if schema is InitialPlan or round_index == 3 else "auto")
+                    if schema is InitialPlan or cfg.ai_tool_mode == "proposal" or failures or round_index == 3 else "auto")
                 usage = result.get("usage") or {}
                 with SessionLocal.begin() as db:
                     run = db.get(Run, run_id)
-                    run.metrics = {**run.metrics, "model_id": result["model"], "usage": usage}
+                    run.metrics = {**run.metrics, "provider": cfg.ai_provider, "model_id": result["model"], "usage": usage}
                 try:
                     calls = result.get("tool_calls") or []
                     if len(calls) != 1 or not isinstance(calls[0], dict):
@@ -243,6 +291,15 @@ async def generate(run_id, context, schema, purpose, validator=None):
                     return proposal
                 except (ValueError, ValidationError, KeyError, TypeError) as exc:
                     failures += 1
+                    # Safe structural diagnostics, never raw model output or user data.
+                    with SessionLocal.begin() as db:
+                        run = db.get(Run, run_id)
+                        diagnostic = {"round": round_index + 1, "type": type(exc).__name__}
+                        if isinstance(exc, ValidationError):
+                            diagnostic["fields"] = [{"loc": list(e["loc"]), "type": e["type"]} for e in exc.errors()][:10]
+                        elif type(exc) is ValueError:
+                            diagnostic["reason"] = str(exc)[:250]
+                        run.metrics = {**run.metrics, "proposal_validation": [*run.metrics.get("proposal_validation", []), diagnostic]}
                     if failures >= 2:
                         raise AdapterError("invalid_proposal", "Model returned an invalid proposal; previous plan preserved") from None
                     detail = str(exc)[:250] if type(exc) is ValueError else type(exc).__name__

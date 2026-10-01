@@ -8,6 +8,7 @@ from sqlalchemy import select
 from fastapi import HTTPException
 from .db import Space, Task, Record, Notification, Run, Job, now, uid
 from .services import serialize, update_risk, queue
+from .config import config
 
 
 def fingerprint(value):
@@ -123,7 +124,7 @@ def notify(db, space, goal, category, reason_key, body, due_at=None):
     if category == "action":
         # Keep one unsent action reminder per goal across a closed contact window.
         pending = db.scalar(select(Notification).where(Notification.goal_id == goal.id,
-            Notification.category == "action", Notification.send_state == "pending", Notification.action_state == "open")
+            Notification.category == "action", Notification.send_state.in_(("pending", "in_app")), Notification.action_state == "open")
             .order_by(Notification.created_at.desc()).limit(1))
         if pending:
             pending.body = {"goal_title": goal.title, **body,
@@ -132,7 +133,7 @@ def notify(db, space, goal, category, reason_key, body, due_at=None):
             return pending
     if category == "important_change" and space.role == "owner":
         pending = db.scalar(select(Notification).where(Notification.goal_id == goal.id,
-            Notification.category == category, Notification.send_state == "pending", Notification.action_state == "open",
+            Notification.category == category, Notification.send_state.in_(("pending", "in_app")), Notification.action_state == "open",
             Notification.created_at >= now() - timedelta(minutes=1)).order_by(Notification.created_at.desc()).limit(1))
         if pending:
             rows = {t.id: t for t in db.scalars(select(Task).where(Task.goal_id == goal.id))}
@@ -157,7 +158,7 @@ def notify(db, space, goal, category, reason_key, body, due_at=None):
             due_at = now() + timedelta(minutes=1)
     note = Notification(id=uid(), space_id=space.id, goal_id=goal.id, category=category, reason_key=reason_key,
                         body={"goal_title": goal.title, **body}, due_at=next_contact(space.settings, due_at),
-                        send_state="in_app" if space.role == "demo" or not space.settings.get("proactive", True) else "pending")
+                        send_state="in_app" if space.role == "demo" or config().notification_channel == "in_app" or not space.settings.get("proactive", True) else "pending")
     db.add(note)
     return note
 

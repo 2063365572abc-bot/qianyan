@@ -67,8 +67,16 @@ class VersionInput(StrictModel):
 class GoalChange(StrictModel):
     version: int
     title: str | None = Field(default=None, min_length=1, max_length=200)
+    intent: str | None = Field(default=None, min_length=1, max_length=6000)
     deadline: datetime | None = None
     capacity_hours_per_day: float | None = Field(default=None, gt=0, le=24)
+
+    @field_validator("title", "intent")
+    @classmethod
+    def text_required_when_supplied(cls, value):
+        if value is None:
+            raise ValueError("目标文本不能为空 / Goal text cannot be null")
+        return value
 
 
 class TaskChange(StrictModel):
@@ -145,7 +153,9 @@ class PlanTask(StrictModel):
     title: str = Field(min_length=1, max_length=300)
     priority: int = Field(default=3, ge=1, le=5)
     depends_on: list[str] = Field(default_factory=list, max_length=10)
-    criteria: dict = Field(default_factory=lambda: {"kind": "user"})
+    criteria: dict = Field(default_factory=lambda: {"kind": "user"}, json_schema_extra={
+        "type": "object", "properties": {"kind": {"type": "string", "enum": ["user", "readme", "ci", "deployment", "repo", "core_dir"]}},
+        "required": ["kind"], "additionalProperties": False})
     estimate_hours: float = Field(default=1, gt=0, le=100)
 
 

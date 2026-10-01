@@ -128,6 +128,7 @@ export default function App() {
       succeeded: t("已更新", "Updated"),
       failed: t("运行失败", "Failed"),
       accepted: t("平台已接受", "Provider accepted"),
+      in_app: t("平台内通知", "In-app notification"),
       queued: t("待发送", "Queued"),
       disabled: t("未启用", "Disabled"),
       demo_only: t("仅网页样例", "Demo inbox only"),
@@ -294,7 +295,7 @@ export default function App() {
       history.replaceState({}, "", "/");
     }
   };
-  const goal = state?.goals.find((x) => x.id === goalId) || state?.goals[0];
+  const goal = goalId === "personal" ? undefined : state?.goals.find((x) => x.id === goalId) || state?.goals[0];
   const demo = state?.space.role === "demo" || session === "demo";
   const label = state?.space.settings.name || "Qianyan";
   const focusTasks = (state?.goals || [])
@@ -655,7 +656,7 @@ export default function App() {
               </button>
             </div>
           )}
-          {state && !state.integrations.nebius && (
+          {state && !state.integrations.ai && (
             <div className="banner subtle">
               <CircleHelp size={17} />
               <span>
@@ -805,6 +806,12 @@ export default function App() {
                       </div>
                       {state.goals.length > 0 && (
                         <div className="goal-tabs">
+                          <button className={goalId === "personal" ? "active" : ""} onClick={() => {
+                            setGoalId("personal");
+                            const url = new URL(location.href);
+                            url.searchParams.set("goal", "personal");
+                            history.replaceState({}, "", url);
+                          }}>{t("个人空间", "Personal space")}</button>
                           {state.goals.map((item) => (
                             <button
                               key={item.id}
@@ -843,7 +850,7 @@ export default function App() {
                             onClick={() => setNewGoal(true)}
                           >
                             <Plus size={16} />
-                            {t("创建第一个目标", "Create your first goal")}
+                            {t("交代一个目标", "Delegate a goal")}
                           </button>
                         </div>
                       ) : (
@@ -1059,12 +1066,19 @@ export default function App() {
                             ))}
                           </div>
                           {goal.tasks.length === 0 && !pending && (
-                            <p className="muted empty-inline">
+                            <div className="muted empty-inline">
+                            <p>
                               {t(
                                 "还没有生成任务。请查看对话与运行状态。",
                                 "No tasks yet. Check the conversation and run status.",
                               )}
                             </p>
+                            {goal.status === "draft" && !!state.integrations.ai && (
+                              <button className="secondary" disabled={busy} onClick={() => void mutate(`/goals/${goal.id}/plan`, "POST", {version: goal.plan_version})}>
+                                <RefreshCw size={15} />{t("重新生成计划", "Retry planning")}
+                              </button>
+                            )}
+                            </div>
                           )}
                           <div className="next-step">
                             <span className="eyebrow">
@@ -1266,6 +1280,7 @@ export default function App() {
                                 {message.source === "wecom" ? " · WeCom" : ""}
                               </span>
                               <p className="preserve">{words(message.body)}</p>
+                              <small className="muted">{state.goals.find((g) => g.id === message.goal_id)?.title || t("个人空间", "Personal space")}</small>
                               <time>{date(message.created_at)}</time>
                             </div>
                           ))}
@@ -1492,6 +1507,7 @@ export default function App() {
                                 ),
                                 decision: t("需要判断", "Decision needed"),
                                 reminder: t("行动提醒", "Action reminder"),
+                                action: t("行动提醒", "Action reminder"),
                               } as Record<string, string>
                             )[item.category] || item.category}{" "}
                             · {date(item.due_at)} ·{" "}
@@ -2305,6 +2321,7 @@ export default function App() {
                 await mutate(`/goals/${editingGoal.id}`, "PATCH", {
                   version: editingGoal.plan_version,
                   title: form.get("title"),
+                  intent: form.get("intent"),
                   deadline: deadline ? new Date(deadline).toISOString() : null,
                 })
               )
@@ -2319,6 +2336,10 @@ export default function App() {
                 required
                 maxLength={160}
               />
+            </label>
+            <label>
+              {t("目标说明与当前范围", "Intent and current scope")}
+              <textarea name="intent" defaultValue={editingGoal.intent} required maxLength={6000} rows={3} />
             </label>
             <label>
               {t("硬截止时间", "Hard deadline")}

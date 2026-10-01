@@ -61,6 +61,65 @@ def state(client):
     return response.json()
 
 
+@pytest.mark.asyncio
+async def test_personal_instructions_persist_without_model_or_external_effects(product):
+    client, space_id = product("owner")
+    for instruction in ("以后只在下午提醒我", "请记住我每天只有两小时可以做项目"):
+        response = client.post("/api/messages", json={"text": instruction}).json()
+        with SessionLocal() as db:
+            job_id = db.scalar(select(Job.id).where(Job.payload["run_id"].as_string() == response["run_id"]))
+        await run_test_job(job_id)
+    saved = state(client)
+    assert saved["space"]["settings"]["notification_start"] == "12:00"
+    assert saved["space"]["settings"]["notification_end"] == "18:00"
+    assert saved["space"]["settings_version"] == 2
+    assert saved["memories"][0]["body"]["content"] == "我每天只有两小时可以做项目"
+    assert saved["memories"][0]["origin_record_id"] is not None
+    assert all(r["status"] == "succeeded" and not r["metrics"].get("model_calls") for r in saved["runs"])
+
+
+def test_initial_plan_retry_is_local_versioned_and_deduplicated(product):
+    client, space_id = product("owner")
+    created = client.post("/api/goals", json={"title": "Draft", "intent": "Prepare a demo"}).json()
+    goal = state(client)["goals"][0]
+    path = f"/api/goals/{goal['id']}/plan"
+    assert client.post(path, json={"version": 999}).status_code == 409
+    assert client.post(path, json={"version": goal["plan_version"]}).json()["run_id"] == created["run_id"]
+    with SessionLocal.begin() as db:
+        db.scalar(select(Job).where(Job.payload["run_id"].as_string() == created["run_id"])).status = "failed"
+        db.get(Run, created["run_id"]).status = "failed"
+    retried = client.post(path, json={"version": goal["plan_version"]}).json()
+    assert retried["run_id"] != created["run_id"]
+    assert client.post(path, json={"version": goal["plan_version"]}).json()["run_id"] == retried["run_id"]
+    other, _ = product("owner")
+    assert other.post(path, json={"version": goal["plan_version"]}).status_code == 404
+    client.post(f"/api/goals/{goal['id']}/tasks", json={"version": goal["plan_version"], "title": "Manual task"})
+    updated = state(client)["goals"][0]
+    assert client.post(path, json={"version": updated["plan_version"]}).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_in_app_notifications_need_no_wechat_and_coalesce_followups(product, monkeypatch):
+    from app.planning import notify
+    client, space_id = product("owner")
+    monkeypatch.setattr(config(), "notification_channel", "in_app")
+    with SessionLocal.begin() as db:
+        space = db.get(Space, space_id)
+        goal = Goal(id=uid(), space_id=space_id, title="Prepare", intent="Prepare", status="active")
+        db.add(goal)
+        db.flush()
+        first = notify(db, space, goal, "action", "one", {"next_action":"Prepare notes"})
+        db.flush()
+        second = notify(db, space, goal, "action", "two", {"next_action":"Recheck notes"})
+        assert first.id == second.id and second.send_state == "in_app"
+        assert second.body["next_action"] == "Recheck notes"
+    def forbidden():
+        raise AssertionError("In-app mode cannot attempt external messaging")
+    monkeypatch.setattr("app.worker.wecom_adapter", forbidden)
+    assert not await send_one_notification()
+    assert state(client)["integrations"]["notification_channel"] == "in_app"
+
+
 def test_space_isolation_and_csrf(product):
     a, _ = product()
     b, _ = product()

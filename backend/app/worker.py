@@ -17,6 +17,7 @@ from .agent import build_context, context_revision, generate, apply_patch, Respo
 from .schemas import InitialPlan
 from .services import confirm_task
 from .dates import deadline_hint, candidate_text
+from .personalization import settings_instruction, memory_instruction
 from .adapters import GitHubAdapter, VercelAdapter, WeComAdapter, Observation, AdapterError
 
 log = logging.getLogger("qianyan.worker")
@@ -179,7 +180,7 @@ async def observe(job_id, token, replay=False):
         if not replay and goal.source_bindings:
             due = now() + timedelta(seconds=config().observation_interval)
             queue(db, space.id, "observe", {}, goal.id, due, f"observe:{goal.id}:{job.id}")
-    if changes and config().nebius_api_key:
+    if changes and config().model_api_key:
         await model_followup(job_id, token, ctx, rev, run_id,
             "Review the newly observed facts and current checked plan. Propose justified priority/dependency/next-action/follow-up changes only if useful. Explain uncertainties.")
 
@@ -239,6 +240,7 @@ async def model_followup(job_id, token, ctx, rev, run_id, purpose):
                 run.patch = {"title": "目标草稿已保存 / Goal draft saved", "goal_id": goal.id,
                     "reason": "初始计划生成后仍需你确认 / Review and confirm the initial plan",
                     "deadline_candidate": hint}
+                response.reply = f"已保存目标草稿：{goal.title}。正在生成初始计划；请检查任务、完成标准和日期，确认后才开始持续跟进。 / Goal draft saved; review the generated plan before activating it."
                 notice = candidate_text(hint)
                 if notice:
                     response.reply = response.reply + "\n\n" + notice
@@ -257,8 +259,21 @@ async def model_followup(job_id, token, ctx, rev, run_id, purpose):
 
 def explicit_command(db, space, goal, record):
     text = record.body.get("text", "").strip()
-    if text.startswith(("记住：", "记住:", "/remember ")):
-        content = text.split(":", 1)[-1] if text.startswith("记住:") else text.removeprefix("记住：").removeprefix("/remember ")
+    try:
+        personal = settings_instruction(text, space.settings)
+    except ValueError:
+        return "提醒时间格式无效，请使用例如‘只在14:00到18:00提醒我’，或在管家设置中调整。"
+    if personal:
+        space.settings, changes = personal
+        space.settings_version += 1
+        for owned in db.scalars(select(Goal).where(Goal.space_id == space.id)):
+            update_risk(db, owned)
+        add_record(db, space.id, "decision", {"settings_changed": changes, "user_record_id": record.id}, source="user")
+        if "notification_start" in changes:
+            return f"已保存提醒时间：{changes['notification_start']}–{changes['notification_end']}（{space.settings['timezone']}）。后台通知将遵守这个窗口；可在管家设置中调整。"
+        return "已保存你的管家设置，可以在管家设置中查看和修改。"
+    content = text.removeprefix("/remember ").strip() if text.startswith("/remember ") else memory_instruction(text)
+    if content is not None:
         if not content.strip() or len(content) > 3000:
             raise AdapterError("input", "记忆需为1–3000字 / Memory must contain 1–3000 characters")
         memory = add_record(db, space.id, "memory", {"content": content.strip()}, goal.id if goal else None, "user")
@@ -321,7 +336,9 @@ async def message(job_id, token):
         "Respond to the latest user message using remembered preferences and current goal. Ask for subjective/offline progress if missing. "
         "If no selected goal, do not submit a patch. For an explicitly delegated new goal you can return capture_goal for an unconfirmed draft, "
         "or ask a focused question if ambiguous. Never invent a hard deadline or user confirmation. "
-        "Explicit remember/done/pause/snooze commands and task controls are processed by the backend. For ambiguous completion, ask for explicit confirmation.")
+        "Explicit remember/done/pause/snooze commands and task controls are processed by the backend. For ambiguous completion, ask for explicit confirmation. "
+        "You cannot write memories or settings from a model proposal. Do not say a preference was saved unless current context proves it. "
+        "For a new personal preference, tell the user to say '记住：...' or use Butler settings; for reminders, a supported example is '以后只在下午提醒我'.")
     with SessionLocal.begin() as db:
         job, space, goal, run = load_claim(db, job_id, token)
         record = db.get(Record, job.payload["record_id"])
@@ -432,6 +449,9 @@ async def send_one_notification():
             if not task or task.goal_id != goal.id or task.status in ("done", "skipped", "blocked"):
                 note.send_state = "cancelled"
                 return True
+        if config().notification_channel == "in_app":
+            note.send_state, note.error = "in_app", None
+            return True
         if note.category == "action" and not note.body.get("user_snooze"):
             # Serialize action-send reservations for this goal, including separate
             # worker processes. Network I/O happens only after the reservation commits.

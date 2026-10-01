@@ -343,7 +343,7 @@ async def test_action_notification_for_completed_task_is_cancelled_before_wecom(
 
     monkeypatch.setattr(worker, "SessionLocal", SimpleNamespace(begin=transaction))
     monkeypatch.setattr(worker, "wecom_adapter", Sender)
-    monkeypatch.setattr(worker, "config", lambda: SimpleNamespace(app_public_url="https://qianyan.example"))
+    monkeypatch.setattr(worker, "config", lambda: SimpleNamespace(app_public_url="https://qianyan.example", notification_channel="wecom"))
     assert await worker.send_one_notification()
     assert not sent, "Completed tasks must not receive old action reminders"
     assert note.send_state == "cancelled"

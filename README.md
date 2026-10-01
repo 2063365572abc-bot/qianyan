@@ -6,23 +6,23 @@ A persistent personal AI butler: tell it a goal once, then let it maintain the p
 
 千言是持续在云端工作的个人管家：交代一次目标，维护计划、记忆与跟进。核心路径是个人设置 → 交代目标 → 确认计划 → 后台跟进 → 回复后调整 → 下次仍记得。GitHub/Vercel 是可选的只读进度来源。
 
-## Implementation and external acceptance
+## Current delivery stage
 
-The approved development baseline is in [Scope](devpost/scope.md), [PRD](devpost/prd.md) and [Technical spec](devpost/spec.md). Local implementation and verification are in progress. On 2026-10-01, native PostgreSQL 16.15 was running, Alembic revision 0001 was applied, and the localhost API returned `database=true, worker_online=true` with an independent worker. A real development database snapshot was restored into an isolated database; details are in [backup evidence](infra/backup-notes.md). This does not establish public deployment or external integration readiness.
+As requested on 2026-10-01, this stage completes the platform's interactions using **Alibaba Cloud Model Studio / qwen-plus**. Notifications remain in the platform inbox. WeCom, further live deployment-provider accounts and public hosting are deferred. Alibaba inference is not evidence of compliance with the Nebius/NVIDIA hackathon requirements; the explicit Nebius/Nemotron provider remains supported for that later stage.
 
-Fixture/demo evidence is labelled as a replay; it is not proof of a live integration. Production deployment, real Nebius account access, provider permissions and actual WeCom phone delivery require credentials and live acceptance. No cloud account or paid resource has been created by this repository. Docker Desktop failed to start on the development machine, so Compose configuration was checked but container builds and Docker backup/restore scripts have not been exercised locally.
+The localhost API, independent worker and PostgreSQL 16.15 are running. Real Alibaba function calling, draft plan generation, personal-memory responses and browser interactions have been exercised. GitHub evidence has also been observed from the actual published repository. Current details and remaining user acceptance are in [delivery evidence](infra/platform-acceptance.md).
 
-The [live GitHub acceptance](infra/live-github-evidence.md) records a published repository, successful cloud CI at the matching SHA, and objective task updates from actual GitHub observations. This closes the GitHub source check; it does not establish live Nemotron, Vercel, WeCom or public application deployment.
+[Cloud CI at 55dcbe2](https://github.com/2063365572abc-bot/qianyan/actions/runs/36808370660) passed backend tests, frontend build and the actual Docker Compose stack, including HTTP journeys through Caddy. Docker Desktop remains unavailable on the development machine; native PostgreSQL provides local persistence. A real snapshot was restored into an isolated database: [backup evidence](infra/backup-notes.md).
 
-技术验收与真正上线分别记录。没有真实账户联调的链路不能宣称已完成；关闭网页后的后台运行由独立 Worker 提供，不能用前端计时器代替。
+Fixture evidence is clearly labelled **replay**. Vercel account access, WeCom phone delivery, public HTTPS hosting and real Nemotron access have not been verified. A development HTTP container run does not establish public production hosting.
 
-本地已实际运行 PostgreSQL 16.15、完成 0001 迁移、启动 API 与独立 Worker，健康检查显示数据库和后台在线；已恢复真实开发库快照到独立测试库。真实模型、数据源、企业微信及公开部署仍需账户联调，Docker 容器运行尚未实测。
+当前先交付可正常交互的平台：阿里云真实模型、个人化设置、持久记忆、目标计划、后台任务、进展证据和平台内收件箱。微信及进一步的外部部署资源接入暂缓。真实 GitHub 与回放来源分别标记；用户体验反馈待用户实际操作后记录。
 
 ## Stack
 
 - React, TypeScript, Vite frontend; Python 3.12 FastAPI API and independent worker.
 - PostgreSQL 16 for settings, memory, goals, evidence, runs, persistent jobs and notification outbox.
-- Runtime NVIDIA Nemotron inference via Nebius Token Factory, with bounded requests and validated plan changes.
+- Explicit model-provider selection: Nebius Token Factory / NVIDIA Nemotron, or Alibaba Cloud Model Studio / Qwen; bounded requests and validated plan changes, with no silent fallback.
 - Read-only GitHub/Vercel adapters and separate WeCom notification adapter.
 - Caddy serves the built frontend and proxies API/callbacks on the same origin. No GPU required.
 
@@ -34,7 +34,7 @@ Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), Node.js 24, Docker 
 python scripts/bootstrap-local.py
 ```
 
-This creates development credentials and saves your local sign-in password in ignored `.local/access.json` without printing it. Alternatively copy `.env.example` to `.env`, fill `POSTGRES_PASSWORD` with a random URL-safe password, set the matching localhost `DATABASE_URL`, and provide `SESSION_SECRET` and `OWNER_PASSWORD_HASH`. For manual hashing, use `app.auth.hash_password` through the backend Python environment and quote the resulting hash in `.env` so Compose preserves its dollar characters. Never place a plaintext owner password in `.env`. Live AI needs `NEBIUS_API_KEY` and an account-verified `NEBIUS_MODEL_ID`. No key should be embedded in frontend variables or source.
+This creates development credentials and saves your local sign-in password in ignored `.local/access.json` without printing it. Alternatively copy `.env.example` to `.env`, fill `POSTGRES_PASSWORD` with a random URL-safe password, set the matching localhost `DATABASE_URL`, and provide `SESSION_SECRET` and `OWNER_PASSWORD_HASH`. For manual hashing, use `app.auth.hash_password` through the backend Python environment and quote the resulting hash in `.env` so Compose preserves its dollar characters. Never place a plaintext owner password in `.env`. For Alibaba inference set `AI_PROVIDER=aliyun`, `ALIYUN_API_KEY`, `ALIYUN_MODEL_ID=qwen-plus` and the correct regional `ALIYUN_BASE_URL`; `AI_TOOL_MODE=proposal` forces a structured proposal from the supplied bounded context. For the hackathon provider set `AI_PROVIDER=nebius`, `NEBIUS_API_KEY` and an account-verified NVIDIA `NEBIUS_MODEL_ID`. `NOTIFICATION_CHANNEL=in_app` requires no WeChat account; select `wecom` only after configuring that integration. No key should be embedded in frontend variables or source.
 
 ```sh
 docker compose --env-file .env -f infra/compose.yaml -f infra/compose.dev.yaml up -d postgres
@@ -97,7 +97,7 @@ If WeCom is not configured yet, omit `--require-live-wecom`; the inbox can work,
 
 Open `http://localhost:5173` after starting the API, worker and frontend. Choose the isolated demo to replay README and deployment events, or sign in using the generated local password in ignored `.local/access.json` to maintain your own goals.
 
-With Nebius configured, delegate a goal such as “Help me finish this project by the end of the month.” Review the absolute deadline, task criteria and dependencies before confirming the draft. Without a model key, add manual tasks; the UI explicitly reports that inference is unavailable. Connect only your selected repository/project to observe actual provider facts.
+With a real model provider configured, delegate a goal such as “Help me finish this project by the end of the month.” Review the absolute deadline, task criteria and dependencies before confirming the draft. Without a model key, add manual tasks; the UI explicitly reports that inference is unavailable. Connect only your selected repository/project to observe actual provider facts.
 
 The worker continues while the webpage is closed. Real phone delivery requires the configured official WeCom application. Replay notifications remain inside the demo and never contact your real account.
 
@@ -116,7 +116,7 @@ Do not treat these commands alone as production proof. Live model requests, prov
 
 ## Privacy and permissions
 
-Owner and anonymous demo sessions use separate spaces. Personal settings and memory live in PostgreSQL, rather than browser storage. Required task context is sent to Nebius for model inference; Qianyan does not claim that all user data stays exclusively on its VM. Secrets are server-only. Memory correction/forgetting and JSON export are part of the product baseline.
+Owner and anonymous demo sessions use separate spaces. Personal settings and memory live in PostgreSQL, rather than browser storage. Required task context is sent to the selected model provider for inference; Qianyan does not claim that all user data stays exclusively on its VM. Secrets are server-only. Memory correction/forgetting and JSON export are part of the product baseline.
 
 ## License
 
